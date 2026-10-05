@@ -197,6 +197,38 @@ class TestRecordParsing(unittest.TestCase):
         _, found = cr.transcript_limit_records(self.path, 0)
         self.assertEqual(found, [])
 
+    def human(self, text, **extra):
+        row = user_row(text)
+        row.update(turnOrigin="human", origin={"kind": "human"}, promptSource="typed")
+        row.update(extra)
+        return row
+
+    def kinds(self, *records, echo=None):
+        self.write(*records)
+        _, found = cr.transcript_limit_records(self.path, 0, echo)
+        return [(r["kind"], r.get("text")) for r in found]
+
+    def test_a_prompt_a_person_typed_is_reported(self):
+        # T30: the one sign that someone took the session over mid-restart.
+        self.assertEqual(self.kinds(self.human("продолжи scratchpad/RESUME.md")),
+                         [("prompt", "продолжи scratchpad/RESUME.md")])
+
+    def test_a_peer_message_is_not_a_prompt(self):
+        peer = user_row("Another Claude session sent a message")
+        peer.update(turnOrigin="peer", origin={"kind": "peer"}, isMeta=True)
+        self.assertEqual(self.kinds(peer), [])
+
+    def test_the_clear_command_row_is_not_a_prompt(self):
+        self.assertEqual(self.kinds(user_row(
+            "<command-name>/clear</command-name>\n<command-message>clear</command-message>")), [])
+
+    def test_a_skill_body_riding_along_is_not_a_second_prompt(self):
+        self.assertEqual(self.kinds(self.human("Base directory for this skill", isMeta=True)), [])
+
+    def test_our_own_phrase_is_an_echo_not_a_prompt(self):
+        self.assertEqual(self.kinds(self.human("continue"), echo="continue"),
+                         [("echo", "continue")])
+
     def test_missing_file(self):
         offset, found = cr.transcript_limit_records(os.path.join(self.dir, "nope.jsonl"), 0)
         self.assertEqual((offset, found), (0, []))

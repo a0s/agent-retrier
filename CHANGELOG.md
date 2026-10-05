@@ -7,6 +7,24 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.0.2] - 2026-10-05
+
+### Fixed
+- A session cleared by hand while the fold waited is no longer cleared a
+  second time. Once the handoff was verified ("folded"), a `/clear` typed by
+  the person was not recognised as one: the wrapper went on to send its own,
+  wiping the turn they had just started in the fresh session, and typed the
+  resume phrase over it. A new session id from claude's own registry at that
+  point now counts as the clear; if the person then submits a prompt of their
+  own, the restart is finished and nothing is unfolded, and if they don't, the
+  session is unfolded once both the keyboard and the new transcript go quiet.
+- The draft gate no longer sees text in an empty prompt box on terminals that
+  speak the kitty keyboard protocol or modifyOtherKeys (Ghostty, cmux, kitty,
+  WezTerm), which Claude Code turns on. Esc, Ctrl+C, Ctrl+U, Ctrl+W and
+  Alt+Backspace arrive there as escape sequences and were not counted as
+  clearing the box, so a restart could sit at "folded" for up to
+  `CR_DRAFT_GRACE_SEC` (10 minutes) behind a draft that was already gone.
+
 ## [3.0.1] - 2026-09-26
 
 ### Changed

@@ -80,7 +80,7 @@
 
 set -u
 
-CR_VERSION="3.0.1"
+CR_VERSION="3.0.2"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.
@@ -1339,6 +1339,11 @@ def project_dir(cwd=None, config_dir=None):
 # are a small fraction of a transcript and the rest are large.
 _ASSISTANT_ROW = re.compile(rb'"type"\s*:\s*"assistant"')
 _COMPACT_ROW = re.compile(rb'"subtype"\s*:\s*"compact_boundary"')
+# A prompt a person submitted, as opposed to one a peer session, a subagent's
+# hand-back or a local command like `/clear` wrote into the same transcript:
+# Claude Code marks the person's own with `turnOrigin: "human"` (and leaves it
+# off the `<command-name>/clear</command-name>` row entirely).
+_HUMAN_PROMPT_ROW = re.compile(rb'"turnOrigin"\s*:\s*"human"')
 
 # The claude CLI's own `/model` command answers itself, before any turn ever
 # reaches the API: "<command-name>/model</command-name>" is the invocation,
@@ -1446,6 +1451,10 @@ def transcript_limit_records(path, offset=0, echo=None):
     know until it is too late: how many tokens the context actually held right
     before claude decided on its own that it was full.
 
+    A prompt a person submitted (`turnOrigin: "human"`) that is none of the
+    echoes comes back as "prompt": the one sign there is that someone took the
+    session over in the middle of a restart.
+
     A message typed while a turn is still running never gets that user row:
     Claude Code queues it, logs a `queue-operation` "enqueue" row, and later
     hands it to the model as an `attachment` row of type `queued_command`
@@ -1468,11 +1477,13 @@ def transcript_limit_records(path, offset=0, echo=None):
         echoish = ((b'"user"' in raw or b"queued_command" in raw or b"queue-operation" in raw)
                    and any(k in raw for k in echo_keys))
         modelish = b"local-command-stdout" in raw and b"Set model to" in raw
+        promptish = bool(_HUMAN_PROMPT_ROW.search(raw))
         # Prefilters only — all four can match on a tool result that merely
         # quotes the words, so the row's own "type" decides below.
         aliveish = bool(_ASSISTANT_ROW.search(raw))
         compactish = bool(_COMPACT_ROW.search(raw))
-        if not limitish and not echoish and not aliveish and not compactish and not modelish:
+        if (not limitish and not echoish and not aliveish and not compactish
+                and not modelish and not promptish):
             continue
         try:
             rec = json.loads(raw.decode("utf-8", "replace"))
@@ -1497,9 +1508,12 @@ def transcript_limit_records(path, offset=0, echo=None):
             continue
         if not rec.get("isApiErrorMessage"):
             text = (record_text(rec)
-                    if (echoish or modelish) and rec.get("type") == "user" else None)
+                    if (echoish or modelish or promptish) and rec.get("type") == "user" else None)
             if text is not None and echoish and text in echoes:
                 out.append(dict(kind="echo", text=text, ts=rec.get("timestamp")))
+            elif (text is not None and promptish and rec.get("turnOrigin") == "human"
+                    and not rec.get("isMeta") and not rec.get("isSidechain")):
+                out.append(dict(kind="prompt", text=text, ts=rec.get("timestamp")))
             elif text is not None and modelish:
                 m = _LOCAL_MODEL_ROW.search(text)
                 slug = (m and (m.group("slug") or _display_to_claude_slug(m.group("display"))))
@@ -3569,6 +3583,8 @@ class Controller:
                                        # the-session debt said so again (T14)
         self._cleared_at = 0.0        # when this restart's CLEARED step began, so a gate
                                        # held past a minute can say so (badge_warn, T14)
+        self._cleared_by_hand = False # CLEARED because a person cleared the session
+                                       # themselves while the fold waited, not by our /clear
         self._off_reason = None       # why context_off was set, for the repeated notify
         self._context_off_acked = False   # a key was pressed while that debt stood (T14)
         self._restart_tick = None     # last tick the restart clock actually ran
@@ -3650,6 +3666,67 @@ class Controller:
             return None
         return i + 2                            # Alt+key
 
+    # Claude Code asks the terminal for the kitty keyboard protocol (`CSI > 5 u`)
+    # and xterm's modifyOtherKeys (`CSI > 4 ; 2 m`) at startup, and a terminal
+    # that honours either one stops sending the plain control bytes for the
+    # keys that empty the input box: Esc arrives as `CSI 27 u`, Ctrl+C as
+    # `CSI 99 ; 5 u` or `CSI 27 ; 5 ; 99 ~`. Skipped as anonymous escapes, they
+    # left a draft that had already been cleared counted as still there, and
+    # that phantom held a context restart behind the draft gate for minutes
+    # (T31). Modifier bits are the protocol's value minus one.
+    _MOD_SHIFT, _MOD_ALT, _MOD_CTRL, _MOD_SUPER = 1, 2, 4, 8
+    _CTRL_CLEARS = (ord("c"), ord("u"), ord("w"))    # ^C clears, ^U/^W erase back
+
+    def _escaped_key(self, data, i, j):
+        """What data[i:j], an escape sequence a key produced, does to the box:
+        "submit", "clear", "erase" (one character), "type" (one more), or None
+        for anything that leaves it alone (arrows, F-keys, key releases...)."""
+        nxt = data[i + 1]
+        if nxt in (0x7f, 0x08) and j == i + 2:
+            return "clear"                      # Alt+Backspace: a word, like ^W
+        if nxt != 0x5b:
+            return None
+        body = data[i + 2:j]
+        if not body or body[-1:] not in (b"u", b"~"):
+            return None
+        fields = body[:-1].split(b";")
+        try:
+            if body[-1:] == b"u":                   # kitty: code[:alt];mods[:event];text
+                code = int(fields[0].split(b":")[0])
+                mod = fields[1].split(b":") if len(fields) > 1 and fields[1] else [b"1"]
+                if len(mod) > 1 and mod[1] == b"3":
+                    return None                     # a key release, not a press
+                mods = int(mod[0]) - 1
+            elif len(fields) == 3 and fields[0] == b"27":   # modifyOtherKeys
+                mods, code = int(fields[1]) - 1, int(fields[2])
+            else:
+                return None
+        except ValueError:
+            return None
+        if mods < 0:
+            return None
+        if code == 27:
+            return "clear" if not mods else None
+        if code == 13:
+            return "submit" if not mods else "type"     # Shift+Enter: a newline
+        if code in (0x7f, 0x08):
+            return "clear" if mods & (self._MOD_ALT | self._MOD_CTRL | self._MOD_SUPER) else "erase"
+        if mods & self._MOD_CTRL and not mods & (self._MOD_ALT | self._MOD_SUPER):
+            return "clear" if code in self._CTRL_CLEARS else None
+        if code >= 0x20 and not mods & (self._MOD_ALT | self._MOD_CTRL | self._MOD_SUPER):
+            return "type"
+        return None
+
+    def _apply_key(self, key):
+        if key in ("submit", "clear"):
+            self.pending_input_chars = 0
+            if key == "submit":
+                self.menu_open = False
+        elif key == "erase":
+            self.pending_input_chars = max(0, self.pending_input_chars - 1)
+        elif key == "type":
+            self.pending_input_chars += 1
+
     def on_user_bytes(self, data, now):
         """Track the human so we never type over a half-written prompt.
 
@@ -3681,6 +3758,7 @@ class Controller:
                 j = self._skip_escape(data, i, n)
                 if j is not None and not self._is_terminal_reply(data, i, j):
                     human = True
+                    self._apply_key(self._escaped_key(data, i, j))
                 if j is None:
                     # Cut in half by the read boundary. Finish it next time rather
                     # than let its tail be mistaken for typing; cap the carry so a
@@ -4091,6 +4169,51 @@ class Controller:
             self.log("context bound: %s (%s)" % (path, why))
         else:
             self.log("transcript switched: %s → %s (%s)" % (old, path, why))
+            if why == "session identity":
+                self._overtaken(now)
+
+    def _overtaken(self, now):
+        """The session's identity moved on before our `/clear` went out.
+
+        Only a person can have done that -- `/clear` (or `/resume`) typed by
+        hand while the fold sat behind a gate -- and the session it leaves in
+        place no longer holds the context the fold was about. Sending our own
+        `/clear` now would wipe whatever they started in its place; one such
+        `/clear` once landed on a session that had already read the handoff
+        and was back at work. Only claude's own registry naming a new session
+        gets here: a guess from the growth heuristic proves nothing of the
+        kind, and our fold phrase echoed elsewhere only corrects which
+        transcript was ours all along.
+        """
+        if self.rstate not in (HANDOFF_SENT, HANDOFF_OK):
+            return
+        at = self.rstate
+        if at == HANDOFF_SENT and self._handoff_fault(self.probe(self.handoff_path)):
+            # The fold never finished, and the session that was asked for it
+            # is gone: there is nothing to unfold, and nobody left to cancel
+            # the ask with.
+            self.log("the session was replaced at %s, before the handoff was "
+                     "finished; dropping this restart" % at)
+            self._end_restart(now)
+            return
+        self.log("the session was cleared by hand at %s; skipping our %s"
+                 % (at, self.cfg["clear_cmd"]))
+        self._cleared_by_hand = True
+        self.restart_left = self.cfg["handoff_timeout"]
+        self._enter_cleared("cleared by hand", now)
+
+    def on_human_prompt(self, now):
+        """A person submitted a prompt to this terminal's session (T30).
+
+        After a clear done by hand, that is them carrying on themselves --
+        reading the handoff, or doing something else entirely -- and typing
+        the resume phrase on top of it would only interrupt them."""
+        if self.rstate != CLEARED or not self._cleared_by_hand:
+            return False
+        self.log("a prompt was typed into the session cleared by hand; "
+                 "the unfold is not needed")
+        self._end_restart(now)
+        return True
 
     def on_candidates(self, ambiguous, now):
         """More than one just-started rollout shares this directory and no
@@ -4847,7 +4970,9 @@ class Controller:
         left to do is unfold it, and the only reason not to yet is a person."""
         if now < self.rwake:
             return None
-        why = self._held(now, session_gate=False)
+        # A clear done by hand is followed by whatever the person does next, so
+        # a session writing to its fresh transcript is theirs to finish first.
+        why = self._held(now, session_gate=self._cleared_by_hand)
         if why:
             return self._renotify(now, "context cleared; unfold is waiting for: %s" % why)
         return self._send_resume(now)
@@ -5303,6 +5428,7 @@ class Controller:
         self._rearm = False
         self._gate_note = None
         self._cancel_sent = False
+        self._cleared_by_hand = False
         self.cooldown_until = now + self.cfg["context_cooldown"]
 
     def _abort_restart(self, why, now, permanent=False):
@@ -6806,6 +6932,10 @@ def main(argv):
                 if rec.get("kind") == "queued":
                     if ctl.handoff_text and rec.get("text") == ctl.handoff_text:
                         ctl.on_handoff_queued(now)
+                    continue
+                if rec.get("kind") == "prompt":
+                    if rec.get("path") == watcher.current and ctl.on_human_prompt(now):
+                        notify("context restart finished by hand; nothing to unfold")
                     continue
                 if rec.get("kind") == "echo":
                     # The fold phrase's nonce is unique machine-wide, so its

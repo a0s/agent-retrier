@@ -387,6 +387,64 @@ class TestTheTerminalTalksBackToo(unittest.TestCase):
         self.assertEqual(self.draft_after(b"\x1b[200~hello\x1b[201~"), 5)
 
 
+class TestTheKeyboardSpeaksKittyToo(unittest.TestCase):
+    """T31. Claude Code asks for the kitty keyboard protocol (`CSI > 5 u`) and
+    modifyOtherKeys (`CSI > 4 ; 2 m`), and a terminal that grants them (Ghostty,
+    cmux, kitty, WezTerm...) sends the keys that empty the box as escape
+    sequences. Field failure: a draft cleared that way stayed counted, and a
+    verified handoff sat behind "unsent text in the prompt box" for seven
+    minutes over an empty box, until its owner cleared the session by hand."""
+
+    def draft_after(self, *chunks):
+        ctl = controller()
+        for t, data in enumerate(chunks):
+            ctl.on_user_bytes(data, now=t)
+        return ctl.pending_input_chars
+
+    def test_esc_as_csi_u_clears_the_draft(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[27u"), 0)
+
+    def test_ctrl_c_as_csi_u_clears_the_draft(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[99;5u"), 0)
+
+    def test_ctrl_u_and_ctrl_w_as_csi_u_clear_it_like_their_plain_bytes(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[117;5u"), 0)
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[119;5u"), 0)
+
+    def test_ctrl_c_under_modify_other_keys_clears_the_draft(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[27;5;99~"), 0)
+
+    def test_alt_backspace_clears_it_like_ctrl_w(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[127;3u"), 0)
+        self.assertEqual(self.draft_after(b"hello", b"\x1b\x7f"), 0)
+
+    def test_enter_as_csi_u_submits(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[13u"), 0)
+
+    def test_shift_enter_is_a_newline_not_a_submit(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[13;2u"), 6)
+
+    def test_backspace_as_csi_u_erases_one(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[127u"), 4)
+
+    def test_a_key_release_changes_nothing(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[99;5:3u"), 5)
+
+    def test_a_typed_character_as_csi_u_counts(self):
+        self.assertEqual(self.draft_after(b"\x1b[97u\x1b[65;2u"), 2)
+
+    def test_arrows_and_function_keys_leave_the_draft_alone(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[D\x1b[1;3C\x1b[15~"), 5)
+
+    def test_a_clear_split_across_two_reads_still_clears(self):
+        self.assertEqual(self.draft_after(b"hello", b"\x1b[99", b";5u"), 0)
+
+    def test_the_pressed_key_is_still_presence(self):
+        ctl = controller()
+        ctl.on_user_bytes(b"\x1b[27u", now=50)
+        self.assertEqual(ctl.last_user_input, 50)
+
+
 class TestPresenceIsNotTraffic(unittest.TestCase):
     """The other half of the same field failure. Swallowing the terminal's
     replies kept them out of the draft counter, but every one of them still
@@ -1055,6 +1113,90 @@ class TestTheClearNeedsConfirmation(RestartTestCase):
 
         self.assertIsNone(ctl.badge_warn(100))          # under a minute since CLEARED began
         self.assertEqual(ctl.badge_warn(130), "unfold?")   # the same hold, past a minute now
+
+
+class TestAClearDoneByHand(RestartTestCase):
+    """T30. Field failure: the handoff was verified, the draft gate held our
+    `/clear` back, and the person cleared the session and pointed it at the
+    handoff themselves. The wrapper, still at "folded", then sent its own
+    `/clear` into that fresh session -- wiping the turn they had just started --
+    and typed the resume phrase over it. A change of session identity while
+    the fold waits is a clear someone else already did."""
+
+    def held_fold(self, ctl):
+        """Folded and verified, with our /clear held back by a draft."""
+        self.fold(ctl)
+        self.folded(ctl)
+        ctl.on_user_bytes(b"x", now=41)
+        self.assertIsNone(self.tick(ctl, 65))
+        self.assertEqual(ctl.rstate, cr.HANDOFF_OK)
+        ctl.on_user_bytes(b"\x1b[27u/clear\r", now=98)   # ...then their own /clear
+        moved(ctl, AFTER, 100, why="session identity")
+
+    def test_our_clear_never_follows_theirs(self):
+        ctl = restart_controller()
+        self.held_fold(ctl)
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+        for t in range(101, 400, 5):
+            self.tick(ctl, t)
+        self.assertNeverCleared()
+
+    def test_a_prompt_of_their_own_means_nothing_is_left_to_unfold(self):
+        ctl = restart_controller()
+        self.held_fold(ctl)
+        self.assertTrue(ctl.on_human_prompt(104))
+        self.assertIsNone(ctl.rstate)
+        for t in range(105, 400, 5):
+            self.tick(ctl, t)
+        self.assertNeverCleared()
+        self.assertNotIn(RESUME, self.injected())
+
+    def test_left_alone_after_it_the_session_is_unfolded(self):
+        ctl = restart_controller()
+        self.held_fold(ctl)
+        self.assertIsNone(self.tick(ctl, 115))      # their keystroke is under 20s old
+        self.assertEqual(self.tick(ctl, 125), ("inject", RESUME, False))
+        self.assertNeverCleared()
+
+    def test_a_turn_of_theirs_in_the_new_session_holds_the_unfold(self):
+        ctl = restart_controller()
+        self.held_fold(ctl)
+        ctl.note_growth([AFTER], 120)
+        self.assertIsNone(self.tick(ctl, 125))
+        self.assertEqual(self.tick(ctl, 141), ("inject", RESUME, False))
+
+    def test_a_guess_from_the_growth_heuristic_is_not_a_clear(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl)
+        ctl.on_user_bytes(b"x", now=41)
+        self.tick(ctl, 65)
+        moved(ctl, AFTER, 100, why="fallback heuristic")
+        self.assertEqual(ctl.rstate, cr.HANDOFF_OK)
+
+    def test_a_finished_handoff_not_yet_latched_counts_too(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl)
+        moved(ctl, AFTER, 45, why="session identity")
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+        self.assertEqual(self.tick(ctl, 70), ("inject", RESUME, False))
+        self.assertNeverCleared()
+
+    def test_a_fold_cut_short_by_it_is_dropped_without_a_word(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        moved(ctl, AFTER, 35, why="session identity")
+        self.assertIsNone(ctl.rstate)
+        for t in range(36, 400, 5):
+            self.tick(ctl, t)
+        self.assertEqual(len(self.injected()), 1)   # the fold phrase, and nothing since
+
+    def test_a_prompt_after_our_own_clear_does_not_cancel_the_unfold(self):
+        ctl = restart_controller()
+        self.cleared(ctl)
+        self.assertFalse(ctl.on_human_prompt(67))
+        self.assertEqual(ctl.rstate, cr.CLEARED)
 
 
 class TestNothingIsClearedOnAPromise(RestartTestCase):
