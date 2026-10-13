@@ -176,6 +176,11 @@ running. `fake_claude.py`'s `FAKE_SCRIPT` directives (`grow`, `dropfirstfold`,
 that keeps climbing, a lost handoff reply, a `<synthetic>` row, a slow
 `/clear` ack, a mid-stream row with no `stop_reason` yet, a `$`/`/` popup that
 eats the first Enter, and an old rollout `codex resume` should still see.
+`FAKE_SESSION_DELAY` and `FAKE_SESSION_FILE=0` are the two things about
+`sessions/<pid>.json` a fake that writes it instantly cannot show: real Claude
+Code takes a second or two over it, which is the whole of the time a wrapper
+started beside another has to decide whose session it is looking at, and some
+claudes never write it at all.
 
 Everything above runs against fakes. One thing cannot: whether real codex
 still accepts the keystrokes the wrapper sends. `./test/run.sh --live-codex`

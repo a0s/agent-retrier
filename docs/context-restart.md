@@ -151,10 +151,21 @@ from. Three things pin down which one is this terminal's:
 - **claude** identifies it explicitly: Claude Code (>= 2.1.273) writes
   `~/.claude/sessions/<pid>.json` naming the transcript for that pid, and the
   wrapper reads it (`ClaudeSessionRegistry`) rather than guessing which file
-  grew last. An older build, or a registry that cannot resolve one candidate
-  unambiguously, falls back to a heuristic instead — see
-  [Caveats](#caveats) for exactly when that applies and what it still gets
-  wrong.
+  grew last. A record is this terminal's because of whose process wrote it —
+  the pid the wrapper forked, or a descendant of it when the command is an
+  alias and claude runs one shell further down — and for no other reason. In
+  particular not because it is in this directory and started after the wrapper
+  did: a second session started beside this one fits that description exactly
+  as well.
+
+  That file is written a second or two after claude starts, so every launch
+  begins with **nobody named yet**. For that stretch the wrapper picks no
+  transcript at all — there is no context count, no turn, and no answer that
+  could end a wait, only limits, which are the account's and are read from
+  any transcript. It waits `CR_SESSION_GRACE_SEC` (30 s) for the file. Only a
+  claude that never writes one — an older build, `claude attach`, the agent
+  roster — is followed by a heuristic after that; see [Caveats](#caveats) for
+  what the heuristic still gets wrong.
 - **codex** has no such file to read (a rollout's head names no pid), so
   identity rests on the one thing nobody else can produce: the fold phrase's
   nonce (`HANDOFF-xxxxxxxx`), unique machine-wide. Its echo landing in a
@@ -592,13 +603,21 @@ Look in `~/.agent-retrier/log`. In order of likelihood:
   (`ClaudeSessionRegistry`) — never by guessing which file grew last, so
   another live session under the same working directory has no effect on it,
   even while it is briefly the busier of the two.
-- Without that file (an older Claude Code, or the registry never resolving one
-  unambiguously), the watcher falls back to its previous heuristic: stay with
-  the transcript already being followed while it grows, and otherwise prefer
-  whichever one did not exist when the session started. That fallback carries
-  the same limitation as before — another live session under the same working
-  directory can, briefly, be the file that grew last — and a
-  `no session registry for pid …` line in the log says when it is in effect.
+- Until that file is written — the first second or two of every launch —
+  the wrapper follows no transcript, rather than the one that happens to be
+  growing. It used to guess: bound for that moment to whichever session had
+  started in the directory since it did, a wrapper started together with
+  another read the other's context as its own.
+- Without that file at all (an older Claude Code, `claude attach`, the agent
+  roster, or two candidates the registry cannot tell apart), the watcher gives
+  it `CR_SESSION_GRACE_SEC` and then falls back to its previous heuristic:
+  stay with the transcript already being followed while it grows, and
+  otherwise prefer whichever one did not exist when the session started. That
+  fallback carries the same limitation as before — another live session under
+  the same working directory can, briefly, be the file that grew last — and a
+  `no session registry for pid … after 30s; falling back to newest transcript`
+  line in the log says when it is in effect. It is logged when the fallback
+  begins, not at every launch.
 
 ## Settings
 

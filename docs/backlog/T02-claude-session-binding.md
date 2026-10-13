@@ -2,6 +2,12 @@
 
 Priority: P0 · Epic: A · Depends on: T01 · Size: L
 
+> Amended by [T32](T32-session-not-yet-named.md): the "`startedAt` ≥ our start
+> time" half of item 1 below is gone. It bound whichever session started in
+> the directory after us, and every bind it made in the field was one of
+> those. The heuristic of item 3 also no longer runs until the registry has
+> had `CR_SESSION_GRACE_SEC` to name the session.
+
 ## Problem
 
 `TranscriptWatcher._pick_current` (agent-retrier.sh:1816) selects “our”

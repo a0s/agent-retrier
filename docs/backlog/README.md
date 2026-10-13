@@ -156,6 +156,7 @@ deliberately spends quota, and which nothing else depends on.
 | [T26](T26-two-session-test-infra.md) | Test infrastructure: two sessions in one project | P1 | E |
 | [T30](T30-clear-done-by-hand.md) | A clear done by hand while the fold waits | P0 | B |
 | [T31](T31-kitty-keys-in-the-draft-gate.md) | The draft gate under the kitty keyboard protocol | P0 | B |
+| [T32](T32-session-not-yet-named.md) | A session that is not named yet is not guessed at | P0 | A |
 
 Epics: A — session identity; B — restart-machine guarantees; C — models and
 windows; D — per-agent commands and input; E — miscellaneous; F — subagent

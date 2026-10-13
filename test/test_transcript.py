@@ -5,11 +5,13 @@ A limited turn is written as a record carrying `"error": "rate_limit"` and
 removes the entire "text about an error vs. a live error" ambiguity that the
 screen-scraping design can only ever approximate.
 """
+import inspect
 import json
 import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from helper import load
 
@@ -56,7 +58,11 @@ class FakeRegistry:
     """A stand-in for ClaudeSessionRegistry: hands back whichever queued
     `(record, why)` answer is next, repeating the last one once exhausted —
     the same shape a real `sessions/<pid>.json` gives across polls once
-    nothing about it has changed."""
+    nothing about it has changed. With no answers at all it names nobody,
+    which is what a claude that has not written its file yet looks like, and
+    one that never will."""
+
+    child_pid = 4242
 
     def __init__(self, *answers):
         self.answers = list(answers)
@@ -359,6 +365,190 @@ class TestWatcher(unittest.TestCase):
         self.assertEqual(w.current, self.path("b.jsonl"))
 
 
+OURS = {"sessionId": "ours", "status": "idle", "statusUpdatedAt": 0}
+
+
+class TestBeforeTheRegistryHasNamedAnyone(unittest.TestCase):
+    """T32. Every launch begins with a registry that names nobody: Claude Code
+    writes `sessions/<pid>.json` a second or two after it starts. Until it
+    has, a transcript growing in the project is a neighbour's as readily as
+    ours — two wrappers started together in one directory — and the watcher
+    used to take it anyway, the first poll it saw one grow. It waits now."""
+
+    START = 1000.0
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-w-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.logged = []
+
+    def path(self, name):
+        return os.path.join(self.dir, name)
+
+    def append(self, name, rec):
+        with open(self.path(name), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def watcher(self, registry, **kw):
+        return cr.TranscriptWatcher(self.dir, poll=0, now=self.START, registry=registry,
+                                    log=self.logged.append, **kw)
+
+    def test_a_neighbours_transcript_is_not_taken_while_ours_is_unnamed(self):
+        w = self.watcher(FakeRegistry())
+        for t in (0.0, 0.2, 2.0, 4.0, 13.0):
+            self.append("theirs.jsonl", ORDINARY)
+            found = w.poll_now(now=self.START + t)
+            self.assertTrue(found)                  # read...
+            self.assertIsNone(w.current)            # ...and nobody's
+            self.assertIsNone(w.bound_session_id)
+
+    def test_a_limit_is_read_whoever_it_belongs_to(self):
+        # The account's, not a session's: not having been named yet is no
+        # reason to sit on one.
+        w = self.watcher(FakeRegistry())
+        self.append("theirs.jsonl", REAL)
+        self.assertEqual([r["kind"] for r in w.poll_now(now=self.START + 0.2)], ["limit"])
+
+    def test_once_named_the_session_is_ours_and_nothing_of_the_neighbours_is(self):
+        registry = FakeRegistry()
+        w = self.watcher(registry)
+        theirs, ours = self.path("theirs.jsonl"), self.path("ours.jsonl")
+        mine = []           # what main() would hand the controller as this session's
+        for t in (0.2, 2.0):
+            self.append("theirs.jsonl", ORDINARY)
+            mine += [r for r in w.poll_now(now=self.START + t) if r["path"] == w.current]
+        registry.answers = [(OURS, "pid file")]     # our claude's file lands
+        self.append("ours.jsonl", ORDINARY)
+        self.append("theirs.jsonl", ORDINARY)
+        found = w.poll_now(now=self.START + 4.0)
+        mine += [r for r in found if r["path"] == w.current]
+        self.assertEqual(w.current, ours)
+        self.assertEqual(w.bound_session_id, "ours")
+        self.assertEqual(sorted(r["path"] for r in found), [ours, theirs])
+        for t in (6.0, 60.0, 3600.0):               # and it stays ours
+            self.append("theirs.jsonl", ORDINARY)
+            mine += [r for r in w.poll_now(now=self.START + t) if r["path"] == w.current]
+            self.assertEqual(w.current, ours)
+        self.assertEqual([r["path"] for r in mine], [ours])
+        self.assertEqual([ln for ln in self.logged if "session" in ln],
+                         ["session bound: ours (pid file)"])
+
+    def test_a_row_is_never_read_ahead_of_the_name_it_belongs_under(self):
+        # The file and the session's first row land between the two steps of
+        # one poll. Asked who we are BEFORE reading, the watcher read the row
+        # with nobody named and handed it on as a stranger's — our own limit,
+        # logged as a neighbour's, was how this was first noticed.
+        registry = FakeRegistry()
+        test = self
+
+        class NamedMidPoll(cr.ClaudeAgent):
+            polling = False
+
+            def paths(self, now=None):
+                if self.polling and not registry.answers:
+                    registry.answers = [(OURS, "pid file")]
+                    test.append("ours.jsonl", REAL)
+                    test.append("theirs.jsonl", ORDINARY)
+                    os.utime(test.path("ours.jsonl"), (1, 1))     # theirs is the newer
+                return super().paths(now)
+
+        agent = NamedMidPoll(self.dir)
+        w = cr.TranscriptWatcher(poll=0, now=self.START, registry=registry, agent=agent)
+        agent.polling = True                 # the scan that seeds the watcher is over
+        found = w.poll_now(now=self.START + 0.2)
+        self.assertEqual(w.current, self.path("ours.jsonl"))
+        self.assertEqual([r["path"] for r in found if r["kind"] == "limit"], [w.current])
+
+    def test_the_heuristic_gets_its_turn_when_the_wait_runs_out(self):
+        # A claude that writes no session file at all: an older build,
+        # `claude attach`, the roster. Said once, when it starts to matter.
+        registry = FakeRegistry()
+        registry.child_pid = 999
+        w = self.watcher(registry)
+        self.append("a.jsonl", ORDINARY)
+        w.poll_now(now=self.START + 29.9)            # thirty seconds, unless told
+        self.assertIsNone(w.current)
+        self.assertEqual(self.logged, [])
+        for t in (30, 32, 34):
+            self.append("a.jsonl", ORDINARY)
+            w.poll_now(now=self.START + t)
+            self.assertEqual(w.current, self.path("a.jsonl"))
+        said = [ln for ln in self.logged if "no session registry for pid 999" in ln]
+        self.assertEqual(len(said), 1)
+        self.assertIn("after 30s; falling back to newest transcript", said[0])
+
+    def test_the_wait_is_as_long_as_it_is_told(self):
+        w = self.watcher(FakeRegistry(), grace=5)    # CR_SESSION_GRACE_SEC
+        self.append("a.jsonl", ORDINARY)
+        w.poll_now(now=self.START + 4.9)
+        self.assertIsNone(w.current)
+        self.append("a.jsonl", ORDINARY)
+        w.poll_now(now=self.START + 5)
+        self.assertEqual(w.current, self.path("a.jsonl"))
+        self.assertIn("after 5s", self.logged[-1])
+
+    def test_a_file_that_comes_after_the_wait_still_decides(self):
+        registry = FakeRegistry()
+        w = self.watcher(registry)
+        self.append("theirs.jsonl", ORDINARY)
+        w.poll_now(now=self.START + 31)
+        self.assertEqual(w.current, self.path("theirs.jsonl"))     # the guess
+        registry.answers = [(OURS, "pid file")]
+        w.poll_now(now=self.START + 33)
+        self.assertEqual(w.current, self.path("ours.jsonl"))
+        self.append("theirs.jsonl", ORDINARY)                       # ...which never returns
+        w.poll_now(now=self.START + 35)
+        self.assertEqual(w.current, self.path("ours.jsonl"))
+
+    def test_a_session_whose_file_has_gone_is_still_the_session(self):
+        # Claude Code removes the file as it exits, a poll or so before the
+        # pty closes. That is not the moment to go looking for another.
+        w = self.watcher(FakeRegistry((OURS, "pid file"), (None, None)))
+        w.poll_now(now=self.START + 2)
+        self.assertEqual(w.current, self.path("ours.jsonl"))
+        for t in (4, 40, 4000):
+            self.append("theirs.jsonl", ORDINARY)
+            w.poll_now(now=self.START + t)
+            self.assertEqual(w.current, self.path("ours.jsonl"))
+            self.assertEqual(w.bound_session_id, "ours")
+        self.assertFalse([ln for ln in self.logged if "falling back" in ln])
+
+    def test_without_a_registry_there_is_nothing_to_wait_for(self):
+        # codex: the heuristic is all there has ever been, from the first poll.
+        w = cr.TranscriptWatcher(self.dir, poll=0, now=self.START)
+        self.append("a.jsonl", ORDINARY)
+        w.poll_now(now=self.START + 0.2)
+        self.assertEqual(w.current, self.path("a.jsonl"))
+
+
+STARTED = 4000      # this wrapper's own start, on the clock `startedAt` is written in
+
+
+def session_registry(config_dir, child_pid, **kw):
+    """A `ClaudeSessionRegistry` given what `main()` has to give one.
+
+    Our own start time is part of that for any registry that asks for it. The
+    one that shipped until T32 did, and bound a session on nothing more than
+    its having started after us; this one takes no clock at all. Should one
+    ask again, it gets `STARTED` here — and every neighbour in the tests below
+    started after that, in our cwd, which is all that rule ever looked at.
+    """
+    kw.setdefault("proc_table", lambda: {})
+    if "started_at" in inspect.signature(cr.ClaudeSessionRegistry).parameters:
+        kw.setdefault("started_at", STARTED)
+    return cr.ClaudeSessionRegistry(child_pid, cwd="/work", config_dir=config_dir, **kw)
+
+
+def session_record(sessions, pid, **fields):
+    rec = {"pid": pid, "sessionId": "s-%d" % pid, "cwd": "/work",
+           "startedAt": 1000, "version": "2.1.273", "kind": "interactive",
+           "status": "idle", "statusUpdatedAt": 1000}
+    rec.update(fields)
+    with open(os.path.join(sessions, "%d.json" % pid), "w") as fh:
+        json.dump(rec, fh)
+    return rec
+
+
 class TestSessionRegistry(unittest.TestCase):
     """`ClaudeSessionRegistry.lookup()` in isolation: which of
     `sessions/*.json` is ours, given only a child pid and a cwd."""
@@ -370,17 +560,10 @@ class TestSessionRegistry(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
 
     def write(self, pid, **fields):
-        rec = {"pid": pid, "sessionId": "s-%d" % pid, "cwd": "/work",
-               "startedAt": 1000, "version": "2.1.273", "kind": "interactive",
-               "status": "idle", "statusUpdatedAt": 1000}
-        rec.update(fields)
-        with open(os.path.join(self.sessions, "%d.json" % pid), "w") as fh:
-            json.dump(rec, fh)
-        return rec
+        return session_record(self.sessions, pid, **fields)
 
     def registry(self, child_pid, **kw):
-        kw.setdefault("proc_table", lambda: {})
-        return cr.ClaudeSessionRegistry(child_pid, cwd="/work", config_dir=self.dir, **kw)
+        return session_registry(self.dir, child_pid, **kw)
 
     def test_direct_pid_file_is_used_first(self):
         self.write(111)
@@ -397,32 +580,260 @@ class TestSessionRegistry(unittest.TestCase):
         self.assertEqual(rec["sessionId"], "s-200")
         self.assertIn("descendant", why)
 
-    def test_cwd_and_startedAt_fallback_when_not_a_descendant(self):
-        self.write(300, startedAt=5000)
-        rec, why = self.registry(999, started_at=4000).lookup()
-        self.assertEqual(rec["sessionId"], "s-300")
-        self.assertEqual(why, "cwd+startedAt")
+    # -- a record is ours by whose process wrote it, and by nothing else (T32) -- #
+    def test_a_session_started_beside_us_is_not_ours(self):
+        # One candidate, and it is somebody else: a second wrapper's claude,
+        # started in this directory a moment after we were.
+        self.write(300, startedAt=STARTED + 5)
+        self.assertEqual(self.registry(999).lookup(), (None, None))
+
+    def test_two_sessions_start_together_and_ours_is_the_later_file(self):
+        # The race itself. Our claude (111) and a neighbour's (222) were
+        # started in the same instant; theirs has written its file, ours has
+        # not yet. Then ours does.
+        reg = self.registry(111, proc_table=lambda: {111: 50, 222: 60, 50: 1, 60: 1})
+        self.write(222, startedAt=STARTED + 5)
+        for _ in range(3):
+            self.assertEqual(reg.lookup(), (None, None))
+        self.write(111, startedAt=STARTED + 9)
+        rec, why = reg.lookup()
+        self.assertEqual((rec["sessionId"], why), ("s-111", "pid file"))
+
+    def test_our_file_going_away_does_not_hand_us_to_a_neighbour(self):
+        # Hours in, with a neighbour that started since: claude removes its
+        # file on the way out, and for one last poll only theirs is there.
+        reg = self.registry(111)
+        self.write(111)
+        self.write(222, startedAt=STARTED + 3600000)
+        self.assertEqual(reg.lookup()[0]["sessionId"], "s-111")
+        os.unlink(os.path.join(self.sessions, "111.json"))
+        self.assertEqual(reg.lookup(), (None, None))
 
     def test_a_different_cwd_is_never_a_candidate(self):
-        self.write(400, cwd="/elsewhere", startedAt=0)
-        rec, why = self.registry(999, started_at=0).lookup()
+        self.write(400, cwd="/elsewhere")
+        rec, why = self.registry(100, proc_table=lambda: {400: 100}).lookup()
         self.assertIsNone(rec)
 
     def test_ambiguous_candidates_do_not_bind(self):
-        self.write(500, startedAt=5000)
-        self.write(501, startedAt=5000)
-        rec, why = self.registry(999, started_at=4000).lookup()
-        self.assertIsNone(rec)
-
-    def test_no_session_registry_falls_back_and_logs_exactly_once(self):
         logged = []
-        reg = self.registry(999, started_at=0, log=logged.append)
+        self.write(500)
+        self.write(501)
+        reg = self.registry(100, proc_table=lambda: {500: 100, 501: 100}, log=logged.append)
         for _ in range(3):
+            self.assertEqual(reg.lookup(), (None, None))
+        self.assertEqual(len([ln for ln in logged if "2 candidates for pid 100" in ln]), 1)
+
+    def test_naming_nobody_is_said_in_silence(self):
+        # Not yet written, just removed, or never coming: the registry cannot
+        # tell which, so it does not say. `TranscriptWatcher` counts the wait
+        # and is the one to announce the fallback (test above, in its class).
+        logged = []
+        reg = self.registry(999, log=logged.append)
+        self.write(300, startedAt=STARTED + 5)
+        for _ in range(3):
+            self.assertEqual(reg.lookup(), (None, None))
+        self.assertEqual(logged, [])
+
+    def test_a_file_that_is_not_a_record_loses_the_candidate_and_nothing_else(self):
+        # The directory is every Claude Code's on the machine, of any version.
+        for pid, text in ((300, "[1, 2]"), (301, '"busy"'), (302, "{"), (303, "")):
+            with open(os.path.join(self.sessions, "%d.json" % pid), "w") as fh:
+                fh.write(text)
+        self.assertEqual(self.registry(999).lookup(), (None, None))
+        self.assertEqual(self.registry(300).lookup(), (None, None))
+        self.write(200)
+        rec, why = self.registry(100, proc_table=lambda: {200: 100}).lookup()
+        self.assertEqual(rec["sessionId"], "s-200")
+
+    # -- the parent chain, where there is no `ps` to ask ------------------- #
+    def proc(self, **stat):
+        root = os.path.join(self.dir, "proc")
+        for name, text in stat.items():
+            os.makedirs(os.path.join(root, name.lstrip("p")))
+            if text is not None:
+                with open(os.path.join(root, name.lstrip("p"), "stat"), "w") as fh:
+                    fh.write(text)
+        for name in ("self", "net"):                 # /proc is not only pids
+            os.makedirs(os.path.join(root, name))
+        return root
+
+    def test_the_parent_chain_is_read_from_proc(self):
+        root = self.proc(p100="100 (sh) S 1 100 100 0 -1 4194304 1",
+                         p200="200 (node) R 100 200 100 0 -1 4194304 1",
+                         p300="300 (my (odd) name) S 200 300 100 0 -1 4194304 1",
+                         p400=None,                  # gone between listdir and open
+                         p500="500 garbage")
+        self.assertEqual(cr.ClaudeSessionRegistry._proc_table(root),
+                         {100: 1, 200: 100, 300: 200})
+        self.assertEqual(cr.ClaudeSessionRegistry._proc_table(os.path.join(root, "nope")), {})
+
+    def test_proc_stands_in_when_ps_cannot_be_run(self):
+        # A slim container: no procps. An alias launch there has only the
+        # parent chain to be found by, now that nothing else binds.
+        with mock.patch.object(cr.subprocess, "run", side_effect=FileNotFoundError("ps")), \
+                mock.patch.object(cr.ClaudeSessionRegistry, "_proc_table",
+                                  staticmethod(lambda root="/proc": {200: 100, 100: 1})):
+            self.write(200)
+            reg = cr.ClaudeSessionRegistry(100, cwd="/work", config_dir=self.dir)
             rec, why = reg.lookup()
-            self.assertIsNone(rec)
-        matches = [ln for ln in logged if "no session registry for pid 999" in ln]
-        self.assertEqual(len(matches), 1)
-        self.assertIn("falling back to newest transcript", matches[0])
+        self.assertEqual(rec["sessionId"], "s-200")
+        self.assertIn("descendant", why)
+
+
+def answered(tokens, model):
+    """An assistant row the size of a turn sent with `tokens` of context."""
+    return {"type": "assistant", "isSidechain": False, "message": {
+        "role": "assistant", "model": model, "stop_reason": "end_turn",
+        "usage": {"input_tokens": 2, "cache_creation_input_tokens": 1000,
+                  "cache_read_input_tokens": tokens - 1002, "output_tokens": 10},
+        "content": [{"type": "text", "text": "done"}]}}
+
+
+class TestTwoWrappersStartedTogether(unittest.TestCase):
+    """T32 from end to end, without a pty: the real registry, the real watcher
+    and the real controller, handed rows the way `main()` hands them.
+
+    Two wrappers are started in one directory in the same instant. The
+    neighbour's claude (pid 222) has written its session file and is already
+    at work on a small-window model with 700k in it; ours (pid 111, a big
+    one, 50k) has not written its own yet. That is a poll or two of every
+    real launch — and it was the whole of the time this wrapper used to
+    spend bound to the other one's session, reading its count, its model and
+    its turns as its own."""
+
+    THRESHOLD = 510000
+    T0 = 1000.0         # when both were started
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="cr-race-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.sessions = os.path.join(self.home, "sessions")
+        self.project = os.path.join(self.home, "project")
+        os.makedirs(self.sessions)
+        os.makedirs(self.project)
+        self.logged = []
+        self.typed = []
+        cfg = dict(cr.CFG, context_tokens=self.THRESHOLD, wait_scale=1, margin=0,
+                   user_idle=0, handoff_file=os.path.join(self.home, "handoff.md"))
+        self.ctl = cr.Controller(cfg, self.logged.append, now=self.T0)
+        registry = session_registry(self.home, 111, log=self.logged.append,
+                                    proc_table=lambda: {111: 50, 222: 60, 50: 1, 60: 1})
+        self.w = cr.TranscriptWatcher(self.project, poll=0, now=self.T0, registry=registry,
+                                      log=self.logged.append)
+
+    def session(self, pid, name, **fields):
+        session_record(self.sessions, pid, sessionId=name, **fields)
+
+    def path(self, name):
+        return os.path.join(self.project, name + ".jsonl")
+
+    def row(self, name, rec):
+        with open(self.path(name), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def turn(self, at):
+        """One turn of the supervisor's loop, `at` seconds in: poll, and hand
+        on what was read exactly as `main()` does — by path, to whichever
+        transcript is ours."""
+        w, ctl, now = self.w, self.ctl, self.T0 + at
+        recs = w.poll_now(now)
+        if w.current and w.current != ctl.context_path:
+            why = "session identity" if w.bound_session_id else "fallback heuristic"
+            ctl.bind_transcript(w.current, why, now)
+        for rec in recs:
+            ours = rec["path"] == w.current
+            if rec["kind"] == "alive" and ours:
+                ctl.on_context(rec, now)
+                ctl.on_alive(now, "transcript", rec["path"])
+            elif rec["kind"] == "limit":
+                ctl.on_limit(rec["text"], now, "transcript" if ours else "neighbour")
+        ctl.note_growth(w.grown, now)
+        if w.agent_status is not None:
+            ctl.on_agent_status(w.agent_status, w.agent_status_at)
+        action = ctl.tick(now)
+        if action and action[0] == "inject":
+            self.typed.append(action[1])
+        return action
+
+    def assertKnowsNothing(self):
+        self.assertIsNone(self.w.bound_session_id)
+        self.assertIsNone(self.w.current)
+        for name in ("context_path", "context_tokens", "context_model", "context_window",
+                     "agent_status"):
+            self.assertIsNone(getattr(self.ctl, name), name)
+
+    def test_we_do_not_bind_to_the_neighbour_and_keep_nothing_of_theirs(self):
+        self.session(222, "theirs", startedAt=STARTED + 5, status="busy")
+        # Ours is not written yet: the poll at launch, the one two seconds
+        # in, and — for one launch in eight — the one after that.
+        for at in (0.0, 2.0, 4.0):
+            self.row("theirs", answered(700000, "claude-haiku-4-5"))
+            self.turn(at)
+            self.assertKnowsNothing()
+        # ...and, longer than any launch on record has gone unnamed, long
+        # enough for b's turn to have gone quiet: which is when a wrapper
+        # holding 700k for its own would fold.
+        self.turn(28.0)
+        self.assertKnowsNothing()
+        self.assertEqual(self.logged, [])
+        # Then ours is, and our claude answers its first turn.
+        self.session(111, "ours", startedAt=STARTED + 9)
+        self.row("ours", answered(50000, "claude-opus-5"))
+        self.row("theirs", answered(700100, "claude-haiku-4-5"))
+        self.turn(29.0)
+        self.assertEqual(self.w.bound_session_id, "ours")
+        self.assertEqual(self.ctl.context_path, self.path("ours"))
+        self.assertEqual((self.ctl.context_tokens, self.ctl.context_model),
+                         (50000, "claude-opus-5"))
+        self.assertEqual(self.ctl.context_window, 1000000)
+        self.assertEqual(self.ctl.agent_status, "idle")
+        for at in (31.0, 60.0, 600.0):               # and b goes on being b
+            self.row("theirs", answered(700200, "claude-haiku-4-5"))
+            self.turn(at)
+            self.assertEqual(self.ctl.context_tokens, 50000)
+        self.assertEqual(self.typed, [])
+        said = "\n".join(self.logged)
+        self.assertIn("session bound: ours (pid file)", said)
+        for theirs in ("theirs", "haiku", "700k", "rebound", "switched", "folding"):
+            self.assertNotIn(theirs, said)
+
+    def test_the_neighbours_answer_does_not_end_our_wait(self):
+        # Ours takes thirteen seconds to be written — the slowest launch on
+        # record — and in them our own session runs into the limit and the
+        # neighbour, on another model, goes on answering.
+        self.session(222, "theirs", startedAt=STARTED + 5)
+        self.turn(0.0)
+        self.row("ours", REAL)
+        self.turn(2.0)
+        self.assertEqual(self.ctl.state, cr.WAITING)
+        self.row("theirs", answered(700000, "claude-haiku-4-5"))
+        self.turn(12.0)                              # well past ALIVE_GRACE
+        self.assertEqual(self.ctl.state, cr.WAITING)
+        self.session(111, "ours", startedAt=STARTED + 9)
+        self.row("theirs", answered(700100, "claude-haiku-4-5"))
+        self.turn(14.0)
+        self.assertEqual(self.w.bound_session_id, "ours")
+        self.assertEqual(self.ctl.state, cr.WAITING)
+        self.assertFalse([ln for ln in self.logged if "answering again" in ln])
+        self.row("ours", answered(50000, "claude-opus-5"))     # our own does
+        self.turn(16.0)
+        self.assertEqual(self.ctl.state, cr.IDLE)
+
+    def test_our_claude_leaving_does_not_hand_us_to_the_neighbour(self):
+        # The same rule, at the other end of the session: hours in, with a
+        # neighbour started since, claude removes its file on the way out.
+        self.session(111, "ours", startedAt=STARTED + 9)
+        self.row("ours", answered(50000, "claude-opus-5"))
+        self.turn(2.0)
+        self.session(222, "theirs", startedAt=STARTED + 3600000)
+        os.unlink(os.path.join(self.sessions, "111.json"))
+        for at in (7200.0, 7202.0):
+            self.row("theirs", answered(700000, "claude-haiku-4-5"))
+            self.turn(at)
+            self.assertEqual(self.w.bound_session_id, "ours")
+            self.assertEqual(self.ctl.context_path, self.path("ours"))
+            self.assertEqual(self.ctl.context_tokens, 50000)
+        self.assertFalse([ln for ln in self.logged if "rebound" in ln or "switched" in ln])
 
 
 class TestContextFigures(unittest.TestCase):

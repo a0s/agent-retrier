@@ -32,6 +32,15 @@ It also writes `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, the way Claude Code
 >=2.1.273 does, so identity-binding code (T02) has something real to read:
 
   FAKE_SCRIPT      comma-separated scenario directives (see `run_script`)
+  FAKE_SESSION_DELAY  seconds before that file is first written (default 0).
+                      Real Claude Code takes a second or two over it — long
+                      enough for the wrapper to poll, find nothing under its
+                      own pid, and have to decide what that means (T32). The
+                      fake is instant unless told, which is why nothing here
+                      ever had to decide. Everything after it waits too: a
+                      session is named before it writes a row.
+  FAKE_SESSION_FILE   0 = never write it at all: a Claude Code older than the
+                      file, or a `claude attach`
 
 For T27 (the subagent tree overlay) it can also draw two rows of Claude Code's
 own subagent tree and back them with real `subagents/agent-*.{meta.json,jsonl}`
@@ -114,6 +123,8 @@ def write_pid_file(status):
     Code 2.1.273 (see T02's "Verified" section): `startedAt`/`statusUpdatedAt`
     are epoch milliseconds, not ISO strings.
     """
+    if os.environ.get("FAKE_SESSION_FILE", "1") == "0":
+        return
     rec = {"pid": os.getpid(), "sessionId": SESSION[0], "cwd": os.getcwd(),
            "startedAt": STARTED_AT[0], "version": "1.0.0-fake",
            "kind": "interactive", "status": status,
@@ -374,6 +385,7 @@ def main():
         out.write("winsize unknown\r\n")
     out.flush()
 
+    time.sleep(float(os.environ.get("FAKE_SESSION_DELAY", "0")))
     write_pid_file("idle")
     run_script(os.environ.get("FAKE_SCRIPT"))
     threading.Thread(target=maybe_run_statusline, daemon=True).start()

@@ -29,10 +29,30 @@ chain. Each session also gets its own handoff file (`{id}` in
 `CR_HANDOFF_FILE`, or the wrapper's own registry-based coordination when you
 leave it out — see [context-restart.md](context-restart.md#turning-it-on)),
 so two folds in the same project no longer overwrite each other. What is left
-of the old limitation is the fallback path for an older Claude Code with no
-session registry file — see [Caveats](context-restart.md#caveats) — and
-follow [how to read the log by pid](#how-to-read-the-log-by-pid) above to
-untangle the two sessions' log lines while you check.
+of the old limitation is the fallback path for a claude with no session
+registry file (an older Claude Code, `claude attach`, the agent roster) — see
+[Caveats](context-restart.md#caveats) — and follow
+[how to read the log by pid](#how-to-read-the-log-by-pid) above to untangle
+the two sessions' log lines while you check.
+
+What to look for in one session's lines:
+
+- `session bound: <id> (pid file)` a couple of seconds after `start:` is the
+  normal case; `(descendant of pid N)` is the same thing for an alias. From
+  then on that session is the only one read.
+- `session rebound: <old> → <new> (pid file)` is a `/clear` or `/resume` in
+  that terminal.
+- `no session registry for pid N after 30s; falling back to newest transcript`
+  means claude never wrote the file and the heuristic is in charge. Every
+  guess it makes after that is a `transcript switched: … (fallback heuristic)`
+  line.
+- A `session bound:` or `session rebound:` line ending in `(cwd+startedAt)`
+  can only be in a log written by an older wrapper, and is that wrapper bound
+  to a **different** session: one that merely started in the same directory
+  later. It happened as a session's own claude exited beside a neighbour
+  started since, and to `claude attach` and roster sessions for as long as
+  they ran; two wrappers started in the same moment could do it to each
+  other.
 
 ## Unfold failed — what to do
 
@@ -89,10 +109,10 @@ for the full unfold sequence and why giving up looks the way it does.
   this terminal's session writes. claude identifies that transcript
   explicitly and codex confirms it by echo nonce (see
   [two sessions in one project](#two-sessions-in-one-project)); only without a
-  session registry file (an older Claude Code) does the wrapper fall back to
-  guessing which file grew last, and only there can a neighbour under the
-  same working directory briefly win that guess — see
-  [Caveats](context-restart.md#caveats).
+  session registry file (an older Claude Code, `claude attach`, the agent
+  roster) does the wrapper fall back to guessing which file grew last, and
+  only there can a neighbour under the same working directory briefly win
+  that guess — see [Caveats](context-restart.md#caveats).
 - `$skill` and `@file` phrases on codex are not yet given the same safe-typing
   treatment `/` gets, so their Enter can be swallowed by codex's own popup —
   see [codex: skills and file mentions](codex.md#skills-and-file-mentions-in-codex).

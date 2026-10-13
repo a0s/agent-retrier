@@ -88,6 +88,19 @@ the echo confirms a rollout, that one is locked in for the rest of the
 session, and every other candidate seen so far is permanently ruled out —
 a neighbour growing afterwards can no longer hand `current` back to it.
 
+What that does not cover is a neighbour's rollout being the *only* one. Codex
+creates a rollout when a session is first spoken to, not when it starts, so a
+wrapper whose own session has said nothing yet has none — and a second session
+started in the directory since, and already at work, is then one candidate
+and not one of two. The wrapper reads it, and if that count is past the
+threshold once the neighbour's turn has ended, types the fold phrase into its
+own session. The echo corrects it from there (it is what creates this
+session's rollout, and proves which one that is), but the phrase has been
+typed by then, into a session with nothing in it to fold. Claude Code states
+which session a process is running, and the wrapper waits for that rather
+than guess ([which session is mine](context-restart.md#which-session-is-mine));
+nothing codex writes says as much.
+
 ### `codex resume` on an old session
 
 `codex resume <old>` reopens the rollout in the directory named for the day

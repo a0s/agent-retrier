@@ -182,11 +182,108 @@ class TestTwoWrappers(TwoWrappersTestCase):
         self.assertTrue(a.roundtrip(), a.buf[-500:])
         self.assertNotIn("wait cancelled", a.buf)
         self.assertNotIn("session is answering again", "".join(a.log_lines()))
-        # ...and it is still the wait it was. (Not "limit detected
-        # (transcript)": started in the same instant as a neighbour, a wrapper
-        # whose own sessions/<pid>.json is a poll late can be bound to the
-        # neighbour's for that one poll, and reads its own limit as theirs.)
-        self.assertIn("limit detected (", "".join(a.log_lines()))
+        # ...and it is still the wait it was, and still its own: a limit a
+        # wrapper reads off the transcript it is bound to. Until T32 this
+        # could say "(neighbour)" — started in the same instant as b, an a
+        # whose sessions/<pid>.json was the later of the two to be written
+        # was bound to b's for a poll (about every other run of this test),
+        # and a limit row read in that poll was read as theirs.
+        self.assertIn("limit detected (transcript)", "".join(a.log_lines()))
+        self.assertNotIn("fake-session-%d" % b.agent_pid(), "".join(a.log_lines()))
+
+    # -- T32: a session file that is late, the way a real one always is ------- #
+    def bound(self, s):
+        """The session `s` says it is bound to, once it says so."""
+        said = helper.eventually(
+            lambda: [ln for ln in s.log_lines() if "session bound: " in ln], timeout=15)
+        self.assertTrue(said, "".join(s.log_lines()))
+        return said[0].split("session bound: ", 1)[1].strip()
+
+    def test_a_late_session_file_is_waited_for_not_guessed_at(self):
+        # The race, held open. Real Claude Code writes sessions/<pid>.json a
+        # second or two after it starts; the fake writes it at once, which is
+        # why two fakes started together only ever raced by a few
+        # milliseconds. Here a's takes a second — ten polls — and b's is there
+        # from the first: in a's cwd, started after a was, the only candidate
+        # there is. It is still b's.
+        base = {"agent": "claude", "CR_SCRAPE": "never", "CR_POLL_SEC": "0.1"}
+        a, b = self.two(dict(base, FAKE_SESSION_DELAY="1.0"), dict(base))
+        self.assertTrue(a.read_until("ready"))
+        self.assertTrue(b.read_until("ready"))
+        b_said, a_said = self.bound(b), self.bound(a)
+        # (Asked for only now: a wrapper still looking for its session runs
+        # `ps` every poll, and that is a child of its own for a moment.)
+        a_pid, b_pid = a.agent_pid(), b.agent_pid()
+        self.assertEqual(b_said, "fake-session-%d (pid file)" % b_pid)
+        self.assertEqual(a_said, "fake-session-%d (pid file)" % a_pid)
+        a_lines = "".join(a.log_lines())
+        self.assertNotIn("fake-session-%d" % b_pid, a_lines)
+        self.assertNotIn("session rebound", a_lines)
+        self.assertNotIn("fallback heuristic", a_lines)
+
+    def test_a_late_session_file_does_not_fold_us_on_the_neighbours_count(self):
+        # What that binding could do while it lasted. b holds 700k and a
+        # 50k, and only a folds at 510k; for three seconds a has no session
+        # file of its own, and b's transcript is the one growing beside it.
+        # Bound to b's, a read 700k as its own and — the moment b's turn went
+        # quiet — typed the folding phrase into a session a tenth that size.
+        # Then, told whose session it really was, it dropped the restart
+        # without a word to the model it had just told to stop.
+        base = helper.restart_timers(agent="claude", FAKE_MODEL="claude-opus-5")
+        a, b = self.two(dict(base, CR_CONTEXT_TOKENS="510000", FAKE_USAGE="50000",
+                             FAKE_SESSION_DELAY="3.0"),
+                        dict(base, FAKE_USAGE="700000"))
+        self.assertTrue(a.read_until("ready"))
+        self.assertTrue(b.read_until("ready"))
+        self.bound(a)                    # to somebody; whom is the last thing checked
+        own = "fake-session-%d" % a.agent_pid()
+        self.assertTrue(helper.eventually(
+            lambda: any(own in ln for ln in a.log_lines()), timeout=15))
+        # a's fake answers lines in the order they were typed: anything a's
+        # wrapper typed while it had no session of its own is answered before
+        # this is.
+        self.assertTrue(a.roundtrip(), a.buf[-500:])
+        self.assertNotIn("GOT:handoff", a.buf)
+        a_lines = "".join(a.log_lines())
+        self.assertNotIn("folding up", a_lines)
+        self.assertNotIn("700k", a_lines)
+        self.assertEqual(self.bound(a), own + " (pid file)")
+
+    def test_a_claude_that_writes_no_session_file_is_still_followed(self):
+        # The case the wait must not strand: a Claude Code older than the
+        # file, or `claude attach`. Nobody is ever named, so once the wait is
+        # over the growth heuristic takes it from there, as it always did —
+        # and the session is folded on its own count.
+        base = helper.restart_timers(agent="claude", CR_CONTEXT_TOKENS="510000",
+                                     FAKE_MODEL="claude-opus-5", FAKE_USAGE="700000",
+                                     FAKE_SESSION_FILE="0", CR_SESSION_GRACE_SEC="1",
+                                     FAKE_USAGE_DELAY="1.2")
+        a = self.one(base)
+        self.assertTrue(a.read_until("ready"))
+        self.assertTrue(a.read_until("GOT:handoff", timeout=20), a.buf[-500:])
+        lines = a.log_lines()
+        said = [ln for ln in lines if "no session registry for pid %d" % a.agent_pid() in ln]
+        self.assertEqual(len(said), 1, "".join(lines))
+        self.assertIn("after 1s; falling back to newest transcript", said[0])
+        self.assertTrue([ln for ln in lines if "context bound: " in ln
+                         and "(fallback heuristic)" in ln], "".join(lines))
+        self.assertFalse([ln for ln in lines if "session bound" in ln])
+
+    def test_a_limit_is_not_kept_waiting_for_a_name(self):
+        # The wait for a name holds back what is read by path. A limit is
+        # not read that way: it is the account's, and one that lands in those
+        # thirty seconds is scheduled when it lands — not when somebody is
+        # finally named, or given up on.
+        a = self.one({"agent": "claude", "CR_SCRAPE": "never", "CR_WAIT_SCALE": "3600",
+                      "CR_MARGIN_SEC": "0", "CR_POLL_SEC": "0.2", "CR_NOTIFY": "1",
+                      "FAKE_SESSION_FILE": "0",
+                      "FAKE_TRANSCRIPT": "You've hit your weekly limit - resets in 40 hours"})
+        self.assertTrue(a.read_until("ready"))
+        self.assertTrue(a.read_until("usage limit detected", timeout=15))
+        lines = "".join(a.log_lines())
+        self.assertIn("limit detected (", lines)
+        self.assertNotIn("falling back", lines)      # still inside the thirty seconds
+        self.assertNotIn("context bound", lines)
 
     def test_only_the_session_above_the_threshold_is_folded(self):
         # The bug T02 removes: without registry-based identity, a's watcher

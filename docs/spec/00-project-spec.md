@@ -37,7 +37,10 @@ while a stronger identity source exists.
 - codex: a rollout created after startup in our `cwd`, with
   `thread_source=user`, confirmed by an echo of our nonce.
 - The heuristic “most recently grown file” is a fallback only when no strong
-  source exists, and every such switch is visible in the log.
+  source exists, and every such switch is visible in the log. A strong source
+  that has not answered yet is not the same as none: until claude has had
+  `CR_SESSION_GRACE_SEC` to write its session file, no transcript is followed
+  at all, and a session file is ours only by the pid that wrote it (T32).
 
 ### 2. Model profile
 

@@ -934,6 +934,9 @@ CFG = dict(
     wait_scale=max(1e-6, _env("CR_WAIT_SCALE", 1.0, float)),
     poll=_env("CR_POLL_SEC", 2.0, float),
     scrape_confirm=_env("CR_SCRAPE_CONFIRM_SEC", 3.0, float),
+    # How long claude is given to write sessions/<pid>.json before the
+    # wrapper concludes it never will and guesses instead (T32).
+    session_grace=_env("CR_SESSION_GRACE_SEC", 30.0, float),
     # -- transient stalls --
     stall_wait=_env("CR_STALL_WAIT_SEC", 60.0, float),
     stall_backoff=_env("CR_STALL_BACKOFF", 2.0, float),
@@ -1804,38 +1807,59 @@ class ClaudeSessionRegistry:
     claude as a *grandchild*, never touching the pid we hold. `<child_pid>.json`
     is tried first; when it is missing, every `sessions/*.json` whose `cwd`
     matches ours is checked for being a descendant of the child (walking `ppid`
-    the way `ps -o ppid=` would) or, failing that, having started at or after
-    our own start time. More than one candidate surviving that scan means no
-    bind: a wrong guess here is the whole bug T02 exists to remove.
+    the way `ps -o ppid=` would). More than one of those means no bind: a
+    wrong guess here is the whole bug T02 exists to remove.
+
+    And that is all a record can be ours by: whose process wrote it. There
+    was a third rule (T32) — same `cwd`, and `startedAt` no earlier than our
+    own start — for a claude the parent chain could not reach. It describes
+    our session, and describes equally well every session anyone starts in
+    this directory after us; the only thing that told the two apart was
+    there being one of them. So a wrapper started in the same moment as
+    another read the other's session for as long as its own file was the
+    later of the two to be written; one whose claude was on its way out, its
+    file already removed, spent its last poll bound to whichever neighbour
+    had started since; and one with no file of its own at all (`claude
+    attach`, the roster) took the first session to start beside it and kept
+    it, dead or alive, for days. The log of the machine this was written on
+    holds eight binds by that rule: three of the second kind, five of the
+    third, and not one claude of the kind it was written for. Naming nobody
+    is the answer it should have given, and is the answer now:
+    `TranscriptWatcher` knows what to do with that, and it is not to guess.
     """
 
-    def __init__(self, child_pid, cwd=None, config_dir=None, started_at=None,
-                log=None, proc_table=None):
+    def __init__(self, child_pid, cwd=None, config_dir=None, log=None, proc_table=None):
         self.child_pid = child_pid
         self.cwd = cwd or os.getcwd()
         base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
         self.dir = os.path.join(base, "sessions")
-        self.started_at = started_at      # ms epoch, for the cwd+startedAt fallback
         self.log = log or (lambda *_: None)
         self.proc_table = proc_table or self._ps_table
-        self._logged_fallback = False
         self._logged_ambiguous = False
 
     def _read(self, pid):
+        """One record, or None for anything that is not one.
+
+        The directory is shared with every Claude Code on the machine, of
+        whatever version: a file half written, or holding something other
+        than an object, must lose the candidate and never crash the wrapper
+        reading it.
+        """
         try:
             with open(os.path.join(self.dir, "%d.json" % pid)) as fh:
-                return json.load(fh)
+                rec = json.load(fh)
         except (OSError, ValueError):
             return None
+        return rec if isinstance(rec, dict) else None
 
-    @staticmethod
-    def _ps_table():
+    @classmethod
+    def _ps_table(cls):
         """pid -> ppid for every process on the box, read once per lookup()."""
         try:
             out = subprocess.run(["ps", "-axo", "pid=,ppid="],
                                  capture_output=True, text=True, timeout=2)
         except (OSError, subprocess.SubprocessError):
-            return {}
+            return cls._proc_table()
         table = {}
         for line in out.stdout.splitlines():
             parts = line.split()
@@ -1844,6 +1868,31 @@ class ClaudeSessionRegistry:
                     table[int(parts[0])] = int(parts[1])
                 except ValueError:
                     pass
+        return table or cls._proc_table()
+
+    @staticmethod
+    def _proc_table(root="/proc"):
+        """The same table without `ps`, where the kernel publishes one.
+
+        A slim container image ships no procps, and there the parent chain
+        is the only thing left that can find a claude started through an
+        alias — the rule that used to cover for it (see the class) is gone.
+        `comm` is the second field of `stat` and may hold spaces and
+        brackets of its own, so the line is read from its last `)`.
+        """
+        table = {}
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return table
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                with open(os.path.join(root, name, "stat")) as fh:
+                    table[int(name)] = int(fh.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
         return table
 
     def _is_descendant(self, pid, table):
@@ -1856,22 +1905,18 @@ class ClaudeSessionRegistry:
             cur = table.get(cur)
         return False
 
-    def _is_recent(self, started_at):
-        """`startedAt >= ours`, tolerant of whatever a stranger's file holds.
-
-        A malformed or foreign-format entry (a wrong Claude Code version, a
-        half-written file) must lose the candidate, never crash the wrapper
-        reading it.
-        """
-        if not isinstance(started_at, (int, float)):
-            return False
-        return started_at >= self.started_at
-
     def lookup(self):
-        """`(record, why)` for our session, or `(None, None)` if nothing binds."""
+        """`(record, why)` for our session, or `(None, None)` if nothing binds.
+
+        Nothing binding is an answer, not a failure, and it is given in
+        silence: the file not yet written (a second or two into every
+        launch), the file just removed (claude on its way out), or no file
+        ever. Which of those it is only time can say, and the one who is
+        counting is `TranscriptWatcher`.
+        """
         direct = self._read(self.child_pid)
         if direct:
-            self._logged_ambiguous = self._logged_fallback = False
+            self._logged_ambiguous = False
             return direct, "pid file"
         try:
             names = os.listdir(self.dir)
@@ -1893,10 +1938,8 @@ class ClaudeSessionRegistry:
                 table = self.proc_table()
             if self._is_descendant(pid, table):
                 matches.append((rec, "descendant of pid %d" % self.child_pid))
-            elif self.started_at is not None and self._is_recent(rec.get("startedAt")):
-                matches.append((rec, "cwd+startedAt"))
         if len(matches) == 1:
-            self._logged_ambiguous = self._logged_fallback = False
+            self._logged_ambiguous = False
             return matches[0]
         if len(matches) > 1:
             if not self._logged_ambiguous:
@@ -1905,10 +1948,6 @@ class ClaudeSessionRegistry:
                 self._logged_ambiguous = True
             return None, None
         self._logged_ambiguous = False
-        if not self._logged_fallback:
-            self.log("no session registry for pid %d; falling back to newest transcript"
-                     % self.child_pid)
-            self._logged_fallback = True
         return None, None
 
 
@@ -2208,10 +2247,29 @@ class TranscriptWatcher:
     older claude with no pid file), the heuristic is all there is. Files
     already present are seeded at their current size either way, so a
     `--continue` run never replays yesterday's banner.
+
+    Between those two is the stretch every launch begins with (T32): there
+    is a registry, and it has not named anyone yet. Claude Code writes its
+    session file a second or two after it starts — of the fifty launches in
+    the log this was measured from, forty-three had it by the poll two
+    seconds in, six by the one after, and one took thirteen seconds — and
+    until it has, a transcript growing in this directory is a neighbour's
+    as readily as ours. So for `grace` seconds nothing is chosen at all:
+    `current` stays None, and with it everything `main()` hands the
+    controller by path — the context count, the turn, the echo of what we
+    typed, the answer that ends a wait. The files are still read, because a
+    limit is the account's and is acted on whoever's transcript reports it.
+    Waiting costs a session that was going to idle through those seconds
+    anyway; a guess, when it is wrong, folds the context of one session on
+    the size of another's. Only when the grace runs out with no file of
+    ours — a claude that does not write one, `claude attach`, the roster —
+    does the heuristic get its turn, and says so in the log.
     """
 
+    IDENTITY_GRACE = 30.0    # CR_SESSION_GRACE_SEC; the longest wait on record is 13s
+
     def __init__(self, directory=None, poll=2.0, now=None, echo=None, agent=None,
-                registry=None, log=None):
+                registry=None, log=None, grace=None):
         # `directory` stays first and positional: it is how the claude side has
         # always been built, and naming a directory is still the whole of what
         # that side needs.
@@ -2232,7 +2290,11 @@ class TranscriptWatcher:
         self.confirmed = False   # `confirm` has fired: no registry, but no longer a guess (T03)
         self.candidates = []     # kept, fresh, not-yet-ruled-out files (T03)
         self._demoted = set()    # candidates `confirm` has since ruled out
-        self._seed(now or time.time())
+        started = now if now is not None else time.time()
+        self.grace = self.IDENTITY_GRACE if grace is None else grace
+        self.unnamed_until = started + self.grace   # the registry's time to name us (T32)
+        self.guessing = registry is None   # may `_pick_current` choose a transcript?
+        self._seed(started)
         self.preexisting = set(self.offsets)
 
     def _seed(self, now):
@@ -2275,8 +2337,6 @@ class TranscriptWatcher:
         if now < self.next_poll:
             return []
         self.next_poll = now + self.poll
-        if self.registry is not None:
-            self._poll_registry(now)
         found = []
         # The file we are following stays on the list even if it drops off the
         # scan: codex's directories are named for the day, and a session that
@@ -2309,9 +2369,35 @@ class TranscriptWatcher:
         # never see the ambiguity at all (T03).
         self.candidates = [p for p in kept
                            if p not in self.preexisting and p not in self._demoted]
-        if not self.bound_session_id:
+        # Who we are is asked once the files have been read, not before.
+        # Claude Code names a session in `sessions/<pid>.json` before it
+        # writes that session's first row (no launch in the log had a
+        # transcript grow ahead of its name), so whatever was just read, the
+        # name it belongs under is already there to be found. Asked first, a
+        # session file and its first row landing between the two steps had
+        # the row read under the previous name — or under none — and handed
+        # on as a stranger's: a session's own limit, logged as a neighbour's.
+        if self.registry is not None:
+            self._poll_registry(now)
+        if not self.bound_session_id and self._may_guess(now):
             self._pick_current()
         return found
+
+    def _may_guess(self, now):
+        """Has the registry had its time to name us, and named nobody? (T32)
+
+        Asked only while unbound. A session the registry has named once stays
+        the session: its file going missing afterwards is claude on its way
+        out, and nothing is left to choose between by then.
+        """
+        if self.guessing:
+            return True
+        if now < self.unnamed_until:
+            return False
+        self.guessing = True
+        self.log("no session registry for pid %s after %.0fs; falling back to newest transcript"
+                 % (getattr(self.registry, "child_pid", "?"), self.grace))
+        return True
 
     def _poll_registry(self, now):
         """Identity, straight from `sessions/<pid>.json`: no growth to watch.
@@ -3581,6 +3667,7 @@ class Controller:
         self.learned = {}             # slug -> window, from whoever answered
         self.context_limit = None     # the threshold in tokens; None = no trigger
         self.context_path = None      # the transcript those figures came from
+        self.context_guessed = False  # ...picked by the growth heuristic, not named (T32)
         self.context_ambiguous = False   # >1 unconfirmed candidate rollout (T03)
         self.context_grew_at = 0.0    # ...and when it last gained a byte
         self.context_off = False      # a failure bad enough not to repeat
@@ -4205,8 +4292,15 @@ class Controller:
         otherwise leak into this one's first reading. `context_model` is the
         one exception: the API has not yet had a chance to restate it, and
         until it does the old value is still the best guess at the window.
+
+        Unless the file we are leaving was never ours (T32). The registry
+        naming our session over a transcript the growth heuristic had picked
+        in its absence is not the session moving on — it is us having looked
+        in the wrong place — so nothing is carried across it, the model
+        included, and it is not read as a clear done by hand either.
         """
         old = self.context_path
+        guessed, self.context_guessed = self.context_guessed, why == "fallback heuristic"
         self.context_path = path
         self.context_tokens = None
         self.turn_open = None
@@ -4221,8 +4315,26 @@ class Controller:
             self.log("context bound: %s (%s)" % (path, why))
         else:
             self.log("transcript switched: %s → %s (%s)" % (old, path, why))
-            if why == "session identity":
+            if why == "session identity" and guessed:
+                self._disown_the_guess()
+            elif why == "session identity":
                 self._overtaken(now)
+
+    def _disown_the_guess(self):
+        """What was learned off a transcript that turned out not to be ours.
+
+        Back to knowing nothing about the model, which is where a wrapper
+        that has only just been told its session stands anyway: the first
+        row of our own states it, and claude's status line states it again
+        on its next refresh. Until one of them does there is no window and
+        no threshold, so nothing a neighbour's rows said about theirs is
+        left for a fold to be decided on.
+        """
+        self.context_model = None
+        self.context_window = None
+        self.context_limit = None
+        self.context_estimated = False
+        self.window_unknown = None
 
     def _overtaken(self, now):
         """The session's identity moved on before our `/clear` went out.
@@ -4233,9 +4345,10 @@ class Controller:
         `/clear` now would wipe whatever they started in its place; one such
         `/clear` once landed on a session that had already read the handoff
         and was back at work. Only claude's own registry naming a new session
-        gets here: a guess from the growth heuristic proves nothing of the
-        kind, and our fold phrase echoed elsewhere only corrects which
-        transcript was ours all along.
+        in place of one it had named before gets here: a guess from the
+        growth heuristic proves nothing of the kind, and our fold phrase
+        echoed elsewhere — or the registry naming us for the first time, over
+        such a guess — only corrects which transcript was ours all along.
         """
         if self.rstate not in (HANDOFF_SENT, HANDOFF_OK):
             return
@@ -6862,11 +6975,11 @@ def main(argv):
         agents.enabled = False
         tree_screen = None
     usage_log = CodexUsageLog(CFG, log) if agent_name == "codex" and ctl.context_enabled else None
-    registry = (ClaudeSessionRegistry(pid, cwd=os.getcwd(), started_at=int(session_start * 1000), log=log)
+    registry = (ClaudeSessionRegistry(pid, cwd=os.getcwd(), log=log)
                if agent_name == "claude" else None)
     watcher = TranscriptWatcher(poll=CFG["poll"], agent=build_agent(agent_name, argv),
                                 echo=[CFG["message"], ctl.resume_text],
-                                registry=registry, log=log)
+                                registry=registry, log=log, grace=CFG["session_grace"])
     if ctl.context_enabled:
         agent_kind = "codex" if ctl.codex else "claude"
         override = ctl._model_tokens_override()
@@ -7054,8 +7167,12 @@ def main(argv):
                 why = "session identity" if watcher.bound_session_id else "fallback heuristic"
                 ctl.bind_transcript(watcher.current, why, now)
             # >1 candidate and nothing has echoed yet (T03): read on, but a
-            # number that might be a neighbour's is not one to fold on.
-            ctl.on_candidates(len(watcher.candidates) > 1 and not watcher.confirmed
+            # number that might be a neighbour's is not one to fold on. Only
+            # where the watcher is guessing at all, though — while claude's
+            # registry is still being waited for (T32) no transcript has been
+            # picked, so there is no number, and nothing to announce holding.
+            ctl.on_candidates(watcher.guessing and len(watcher.candidates) > 1
+                              and not watcher.confirmed
                               and not watcher.bound_session_id, now)
             for rec in recs:
                 if rec.get("kind") == "queued":

@@ -1199,6 +1199,92 @@ class TestAClearDoneByHand(RestartTestCase):
         self.assertEqual(ctl.rstate, cr.CLEARED)
 
 
+class TestAGuessTheRegistryCorrects(RestartTestCase):
+    """T32. A claude that has written no session file by the time the watcher
+    stops waiting for one is followed by the growth heuristic, and the
+    heuristic can pick a neighbour. If the file does turn up, the switch it
+    causes is the registry naming this session for the first time — over a
+    transcript that was never ours. That is neither a session moving on (whose
+    model is worth keeping until the next row restates it) nor a `/clear` typed
+    by hand (which would end a fold in flight): we were looking in the wrong
+    place, and nothing seen there is ours to keep."""
+
+    THEIRS = "/proj/neighbour.jsonl"
+
+    def guessing(self):
+        ctl = restart_controller()
+        moved(ctl, self.THEIRS, 0, why="fallback heuristic")
+        usage(ctl, 1, FULL, model="claude-haiku-4-5", path=self.THEIRS)
+        self.assertEqual((ctl.context_tokens, ctl.context_model), (FULL, "claude-haiku-4-5"))
+        return ctl
+
+    def test_nothing_read_off_the_neighbour_is_left(self):
+        ctl = self.guessing()
+        moved(ctl, MINE, 5, why="session identity")
+        for name in ("context_tokens", "context_model", "context_window", "context_limit",
+                     "context_window_hint", "last_stop_reason", "window_unknown"):
+            self.assertIsNone(getattr(ctl, name), name)
+        self.assertFalse(ctl.context_estimated)
+        self.assertEqual(ctl.context_grew_at, 0.0)
+        for t in range(6, 400, 5):
+            self.assertIsNone(self.tick(ctl, t))      # ...so there is nothing to fold on
+
+    def test_our_own_first_row_is_a_first_row(self):
+        # Not "model switched: claude-haiku-4-5 → claude-opus-5": this session
+        # was never on haiku.
+        ctl = self.guessing()
+        moved(ctl, MINE, 5, why="session identity")
+        before = len(ctl.log_lines)
+        usage(ctl, 6, 1000)
+        self.assertEqual((ctl.context_tokens, ctl.context_model), (1000, "claude-opus-5"))
+        self.assertEqual(ctl.context_limit, 500000)
+        self.assertFalse([l for l in ctl.log_lines[before:] if "model switched" in l])
+
+    def test_it_is_not_a_clear_done_by_hand(self):
+        # The fold was decided on the neighbour's count, and its phrase typed
+        # into this terminal all the same. Dropping the restart here would
+        # leave the model told to wrap up, and told nothing since.
+        ctl = self.guessing()
+        self.assertEqual(self.tick(ctl, 30)[0], "inject")
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        moved(ctl, MINE, 35, why="session identity")
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        self.assertFalse(ctl._cleared_by_hand)
+        ctl.on_handoff_echo(MINE, 36)                # ...and it carries on, in ours
+        ctl.handoff.write(ctl, at=40)
+        usage(ctl, 40, 1000)
+        self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
+
+    def test_a_session_that_moved_on_still_keeps_its_model(self):
+        # The rule the above is the exception to (T04): after a real `/clear`
+        # the model is the same model until a row says otherwise.
+        ctl = restart_controller()
+        moved(ctl, MINE, 0, why="session identity")
+        usage(ctl, 1, 1000)
+        moved(ctl, AFTER, 5, why="session identity")
+        self.assertEqual(ctl.context_model, "claude-opus-5")
+        self.assertEqual(ctl.context_limit, 500000)
+
+    def test_one_guess_giving_way_to_another_keeps_it_too(self):
+        # Without a registry a switch is as likely the session's own `/clear`
+        # as a neighbour, and there is no telling which.
+        ctl = self.guessing()
+        moved(ctl, AFTER, 5, why="fallback heuristic")
+        self.assertEqual(ctl.context_model, "claude-haiku-4-5")
+
+    def test_only_the_first_naming_is_a_correction(self):
+        # Named once, the next change of name is the session itself moving
+        # on — and at "folded" that is their /clear (T30), as before.
+        ctl = self.guessing()
+        moved(ctl, MINE, 5, why="session identity")
+        self.fold(ctl, at=6, tick_at=30)
+        self.folded(ctl)
+        self.assertIsNone(self.tick(ctl, 45))
+        moved(ctl, AFTER, 50, why="session identity")
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+        self.assertTrue(ctl._cleared_by_hand)
+
+
 class TestNothingIsClearedOnAPromise(RestartTestCase):
     """The dangerous failure in the whole design: the fold was asked for, the
     model did not manage it, and the context is cleared anyway — which loses the
