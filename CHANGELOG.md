@@ -7,6 +7,50 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.0.4] - 2026-10-13
+
+### Fixed
+- A session claude has not named yet is no longer guessed at. Until claude
+  wrote its own session file — two to five seconds after a launch, thirteen at
+  worst on record — the wrapper took any session started in the same directory
+  after it for its own, and the growth heuristic picked a transcript before
+  the registry had answered. Bound to a neighbour, it read their context size,
+  model and turns as its own: a wait could be dropped because the neighbour
+  answered, and a fold could be started on the neighbour's count. It showed at
+  exit and under `claude attach` as well as when two sessions start together.
+  A session is now ours by pid only, nothing is followed for
+  `CR_SESSION_GRACE_SEC` (30) while it is unnamed, and a name that arrives
+  late throws away whatever a guess had learned. Limits are still read during
+  the wait. `no session registry for pid N` is logged once, when the fallback
+  actually begins, and no longer at every launch.
+- A statusline refresh that claude cut short no longer leaves a 300 KB copy of
+  the supervisor in `$TMPDIR`. Claude Code kills the previous statusline
+  command, process group and all, whenever a newer refresh starts, and the
+  `rm` after it never ran: a hundred or two files a day. `--cr-statusline` and
+  `--cr-models` now hand the program to python on a file descriptor, the way
+  the session itself already did, so there is no file to strand; where
+  `/dev/fd` is missing the temp file is removed by a trap and by python's
+  first act. A session, as it starts, removes the leftovers of earlier
+  versions — only files named as `mktemp` named them, owned by you, untouched
+  for a day and beginning the way this program begins. `CR_TMP_SWEEP=0` turns
+  that off.
+- Text about a limit inside a tool call is not taken for the banner when the
+  call's bullet is missing. Claude Code blinks the bullet of a running call
+  and repaints only changed cells, so a header often arrives as a bare
+  ` Bash(grep "hit your session limit…")`, which the mask did not recognise.
+  A row that opens with `Name(` is now masked whatever stands before it, as
+  are the MCP form and codex's `• Ran` / `• Called` rows. An
+  `APIError(529 …overloaded…)` line, which the old mask hid as if it were a
+  tool call, is read again. This only matters where the screen is the
+  deciding channel (`CR_SCRAPE=always`, or before the transcript is found).
+- A file in claude's sessions directory that is not a JSON object no longer
+  crashes the wrapper.
+
+### Changed
+- The test suite runs in about 80 seconds instead of eight minutes, in
+  slices run four at a time (`CR_TEST_JOBS`), and no longer writes into the
+  real `~/.agent-retrier`.
+
 ## [3.0.3] - 2026-10-13
 
 ### Fixed
