@@ -100,8 +100,10 @@ claude, the hard cap minus a 64k reserve for codex — because the right number
 is genuinely not the same on both. `--cr-models` prints the table resolved
 against your machine. `{id}` gives every session a handoff file of its own, so
 a claude and a codex session running side by side in one repo can never write
-over each other. Then `.gitignore` the `.agent-retrier/` directory and you are
-done. → [minimal configs](docs/configuration.md#minimal-configs),
+over each other. The path is relative to where you start the session, and the
+session is always told the absolute one, so the agent and the wrapper cannot
+disagree about where the file is. Then `.gitignore` the `.agent-retrier/`
+directory and you are done. → [minimal configs](docs/configuration.md#minimal-configs),
 [context restart](docs/context-restart.md)
 
 ## What a restart looks like
@@ -135,13 +137,17 @@ catches up with the current codex-cli's TUI.
   and looks up one it has never heard of. → [the context window](docs/context-restart.md#the-context-window)
 - **Keeps two sessions in one project apart**: each gets its own identity, its
   own handoff file, and its own tagged log lines, so neither one's restart can
-  read or clear the other's. → [troubleshooting](docs/troubleshooting.md#two-sessions-in-one-project)
+  read or clear the other's. A session the agent has not named yet is waited
+  for, not guessed at. → [troubleshooting](docs/troubleshooting.md#two-sessions-in-one-project)
 - **Runs your claude, not `claude`**: a binary, a command line, an alias or a
   function. → [custom command](docs/custom-command.md)
 - **Never types over you.** An unsent draft or an unfinished turn makes it wait.
   → [how it works](docs/how-it-works.md#typing-safely)
 - **Passes everything else through** — keys, colours, resizes, exit codes, flags —
   and keeps one dim mark in a corner. → [a sign of life](docs/how-it-works.md#a-sign-of-life)
+- **Leaves nothing behind.** No temp files in `$TMPDIR`, and the ones earlier
+  versions left there are swept when a session starts.
+  → [configuration](docs/configuration.md)
 - **Gets out of the way.** No python3, `claude -p`, or `CR_DISABLE=1`, and it
   execs plain claude. → [how it works](docs/how-it-works.md#getting-out-of-the-way)
 

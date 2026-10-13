@@ -150,7 +150,7 @@ Windows is not supported (no pty).
 ## Tests
 
 ```sh
-./test/run.sh              # 760 tests: patterns, time parsing, transcript, model
+./test/run.sh              # 888 tests: patterns, time parsing, transcript, model
                            # windows, update checks, state machine, the badge, custom
                            # commands, degradation, end-to-end runs on a real pty
                            # (rendered through a terminal emulator, so "what the user
@@ -159,7 +159,15 @@ Windows is not supported (no pty).
 ./test/run.sh --docker     # the same suite on Linux, from anywhere with docker
 ./test/run.sh test_time.py # just one file
 ./test/run.sh --live-codex # the T15 checklist against real codex — asks first
+CR_TEST_JOBS=1 ./test/run.sh   # one file after another, the way it used to run
 ```
+
+The whole run takes about 80 seconds. The files that drive a real pty are cut
+into slices (`test/shard.py`) and run four at a time — `CR_TEST_JOBS` says how
+many — and a file's slices have to add up to its full count, so a slice that
+dies quietly is a failure and not a shorter run. Nothing in the suite touches
+your real `~/.agent-retrier` or `$TMPDIR`: every session gets a state
+directory of its own.
 
 Two wrappers over one project dir — the shape a "chose the wrong session's
 transcript" bug (fold on someone else's numbers, unfold lost) needs to
