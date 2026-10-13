@@ -1076,8 +1076,35 @@ def strip_ansi(text):
 # (upstream issue #63: a grep argument containing banner text parked a monitor
 # for 22 hours.) Same discipline, far cheaper here because we also require the
 # structured channel to be unavailable before scraping at all.
-_TOOL_HEADER = re.compile(r"^\s*[●⏺∙]\s*\S+\(")
+#
+# What makes a row a tool call is the call — `Name(` — and not the bullet in
+# front of it. Claude Code blinks the bullet of a call that is still running,
+# "⏺" and then a space, 600ms each, and paints only the cells that changed: a
+# row first drawn in the dark half reaches us as " Write(HANDOFF.md)", and the
+# "⏺" painted into it afterwards is a line of its own by then (that row is in
+# docs/demo/claude-restart.cast, which is a real session). A header known by
+# its glyph missed every one of those, and a grep for banner text that started
+# in the wrong 600ms was a banner.
+#
+# The name is a tool's: letters, digits, "_", "-", the ":" of a plugin's agent.
+# That is also what keeps a real banner out of here whatever the renderer does
+# to its spacing — a gap is a cursor move as often as a space, and the move is
+# gone by the time we read the row — because both agents open theirs with
+# "You've", and no tool has an apostrophe in its name. Nor is any tool called
+# …Error: a row that opens with "APIError(" is a failure being reported, an
+# "API Error (…" with its gap dropped or an exception printed whole, and that
+# is the one kind of row this is here to read. An MCP tool goes by its display
+# name instead, "server - tool (MCP)(", spaces and a bracket of its own included.
+_CALL = (r"(?:(?![A-Za-z0-9_:-]*[Ee]rror\()[A-Za-z_][A-Za-z0-9_:-]{0,63}"
+         r"|[^()]{1,120}\(MCP\))\(")
+_TOOL_HEADER = re.compile(r"^\s*[●⏺∙]\s*" + _CALL)
 _TOOL_CHILD = re.compile(r"^\s*[⎿└↳]")
+# The same call with anything in front of it, or nothing. codex has no call
+# syntax at all: a command it ran is "• Ran <command>", a tool it called is
+# "• Called server.tool({…})". The words are codex-cli 0.161.0's own, read out
+# of its binary; the rows have not been captured off a real screen yet.
+_TOOL_CALL = re.compile(r"^\W*" + _CALL
+                        + r"|^\s*•\s*(?:Ran|Running|You ran|Called|Calling)\s")
 
 
 def tool_echo_mask(lines):
@@ -1092,6 +1119,13 @@ def tool_echo_mask(lines):
             mask[i] = True
             continue
         in_block = False
+        # A call the TUI's own bullet does not vouch for hides itself and no
+        # more. What hangs under "⏺" is that tool's echo; what hangs under a
+        # row that merely opens with `word(` may be what the session answered
+        # to a prompt you typed — and "⎿  You've hit your session limit" under
+        # your own prompt is exactly where Claude Code draws the real one.
+        # Hiding that is a session left dead overnight to spare a false alarm.
+        mask[i] = bool(_TOOL_CALL.search(line))
     return mask
 
 

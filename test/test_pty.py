@@ -427,17 +427,20 @@ class TestScrapeChannel(PtyTestCase):
     def test_text_about_a_limit_triggers_nothing(self):
         # A tool render quoting banner text: upstream #63, a 22-hour bogus wait.
         #
-        # Drawn the way Claude Code draws a tool call — "⏺ Name(" — because that
-        # header is the only thing that says the line after it is a quotation.
-        # This fixture used to open with "*", which `_TOOL_HEADER` does not
-        # know, and a line like that the wrapper takes for a live banner. The
-        # test stayed green because it stopped looking at 3s, which is when
-        # the confirmation ends, and because a wait until "3pm (UTC)" types
-        # nothing for up to 24 (CR_WAIT_SCALE'd) seconds after that.
+        # The same call three times over, because what says "quotation" is the
+        # call and not the bullet in front of it. "*" is what this fixture
+        # opened with for a long time: `_TOOL_HEADER` knew only "●⏺∙", and the
+        # wrapper took the line for a live banner. The test stayed green
+        # because it stopped looking at 3s, which is when the confirmation
+        # ends, and because a wait until "3pm (UTC)" types nothing for up to
+        # 24 (CR_WAIT_SCALE'd) seconds after that. Nothing at all is how
+        # Claude Code itself draws a call that is still running, every other
+        # 600ms, while its bullet is blinked off. And "⏺" is the other 600.
+        call = 'Bash(grep "hit your session limit - resets 3pm (UTC)" log)'
         s = self.session(
-            env=self.env(FAKE_BANNER='⏺ Bash(grep "hit your session limit - resets 3pm (UTC)" log)'),
+            env=self.env(FAKE_BANNER="\r\n".join(["* " + call, " " + call, "⏺ " + call])),
             cwd=self.work)
-        self.assertTrue(s.read_until("Bash(grep"))
+        self.assertTrue(s.read_until("⏺ Bash(grep"))
         self.confirmed(s)
         self.assertNotIn("limit detected", self.logged())
         self.assertNotIn("GOT:continue", s.buf)

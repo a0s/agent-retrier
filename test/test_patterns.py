@@ -226,5 +226,160 @@ class TestToolEchoMask(unittest.TestCase):
         self.assertEqual(cr.tool_echo_mask(lines), [False])
 
 
+# What the screen channel has actually read off this machine: the two rows
+# Claude Code 2.1.22x drew for a limit, as the wrapper logged them in August
+# (the log keeps the text, not the indent — that part is put back by hand).
+# And codex-cli's wording, which is its transcript's and its binary's.
+SCREEN_BANNERS = [
+    "  ⎿  You've hit your session limit · resets 3:40pm (Europe/Warsaw)\n"
+    "     /upgrade to increase your usage limit.",
+    "  ⎿  You've hit your session limit · resets 2:10am (Europe/Warsaw)\n"
+    "     /upgrade or /usage-credits to finish what you’re working on.",
+    "  ⎿  You've hit your weekly limit · resets Aug 26 at 6am (Europe/Warsaw)\n"
+    "     /upgrade to increase your usage limit.",
+    "■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
+    "to purchase more credits or try again at Aug 20th, 2026 10:00 AM.",
+]
+
+# A command that quotes a banner: upstream #63, word for word.
+QUOTING = 'Bash(grep "hit your session limit - resets 3pm (UTC)" log)'
+
+# One row of a real claude 2.1.2xx session, byte for byte out of
+# docs/demo/claude-restart.cast (the temp path in the hyperlink shortened): a
+# tool call still running, painted in the half of the blink where its bullet
+# is a space — the dim " " in front of the cursor move to column 3.
+PAINTED_WITHOUT_ITS_BULLET = (
+    "\r\x1b[10B\x1b[38;2;153;153;153m \x1b[3G\x1b[39m\x1b[1mWrite\x1b[22m("
+    "\x1b]8;id=3d7qa5;file:///tmp/cr-demo-claude/HANDOFF.md\x07HANDOFF.md\x1b]8;;\x07)"
+    "\x1b[K\r\x1b[1B\x1b[K")
+
+
+class TestACallIsAQuotation(unittest.TestCase):
+    """`Name(` is what makes a row a tool call. The bullet in front of it is not.
+
+    Claude Code blinks the bullet of a call that is still running — "⏺", then
+    a space, 600ms each — and paints only the cells that changed. So the row
+    reaches the wrapper with its bullet or without, whichever half it was
+    first drawn in, and a header known by its glyph was a banner in the dark one.
+    """
+
+    def test_whatever_is_drawn_in_front_of_it(self):
+        # The TUI's own three; nothing, which is the same call a blink later;
+        # and what a list, a diff, a spinner frame or another agent would put
+        # there. None of them makes the command any less of a quotation.
+        for lead in ["⏺ ", "● ", "∙ ", "", " ", "  ", "* ", "• ", "- ", "+ ",
+                     "✻ ", "✽ ", "· ", "│ ", "❯ ", "> "]:
+            with self.subTest(lead=lead):
+                self.assertIsNone(cr.find_limit(lead + QUOTING))
+                self.assertEqual(cr.tool_echo_mask([lead + QUOTING]), [True])
+
+    def test_the_row_claude_code_really_paints(self):
+        rows = [l.rstrip() for l in cr.strip_ansi(PAINTED_WITHOUT_ITS_BULLET).split("\n")]
+        self.assertIn(" Write(HANDOFF.md)", rows)
+        at = rows.index(" Write(HANDOFF.md)")
+        self.assertTrue(cr.tool_echo_mask(rows)[at])
+
+    def test_the_same_paint_with_a_command_that_quotes_a_banner(self):
+        painted = PAINTED_WITHOUT_ITS_BULLET.replace("Write", "Bash").replace(
+            "\x1b]8;id=3d7qa5;file:///tmp/cr-demo-claude/HANDOFF.md\x07HANDOFF.md\x1b]8;;\x07",
+            QUOTING[len("Bash("):-1])
+        self.assertIn(QUOTING, cr.strip_ansi(painted))
+        self.assertIsNone(cr.find_limit(painted))
+
+    def test_an_mcp_tool_goes_by_its_display_name(self):
+        # "server - tool (MCP)(": the one header whose name has spaces in it
+        # and a bracket of its own before the one that opens the arguments.
+        call = ('codegraph - codegraph_explore (MCP)'
+                '(query: "where is the usage limit that resets in an hour logged")')
+        for lead in ["⏺ ", " ", ""]:
+            with self.subTest(lead=lead):
+                self.assertIsNone(cr.find_limit(lead + call))
+
+    def test_a_command_codex_ran(self):
+        # codex has no call syntax: a command is "• Ran <command>", and a
+        # tool it called through MCP is "• Called server.tool({...})".
+        for row in ['• Ran grep -c "5-hour limit reached - resets 3pm (UTC)" x.log',
+                    '• Running grep -c "5-hour limit reached - resets 3pm (UTC)" x.log',
+                    '• Called notes.search({"query":"usage limit resets in an hour"})']:
+            with self.subTest(row=row):
+                self.assertIsNone(cr.find_limit(row))
+        self.assertIsNone(cr.find_stall("• Ran grep -r 'model is at capacity' ."))
+
+    def test_a_stall_quoted_in_one_is_not_a_stall(self):
+        for lead in ["", " ", "* "]:
+            with self.subTest(lead=lead):
+                self.assertIsNone(cr.find_stall(lead + "Bash(grep -r 'model is at capacity' .)"))
+
+
+class TestOnlyTheTuisOwnBulletOwnsWhatHangsUnderIt(unittest.TestCase):
+    """A row that merely opens with `word(` hides itself and nothing else.
+
+    Under "⏺" the next rows are that tool's echo, because the TUI says so.
+    Under anything else they may be what the session answered — and the row
+    under your own prompt is exactly where Claude Code draws the banner.
+    Hiding that one is a session left dead overnight.
+    """
+
+    BANNER = "  ⎿  You've hit your session limit · resets 3:40pm (Europe/Warsaw)"
+
+    def test_a_call_without_the_bullet_masks_itself_only(self):
+        self.assertEqual(cr.tool_echo_mask(["Bash(ls)", self.BANNER]), [True, False])
+        self.assertEqual(cr.tool_echo_mask(["* Bash(ls)", self.BANNER]), [True, False])
+        self.assertEqual(cr.tool_echo_mask(["⏺ Bash(ls)", self.BANNER]), [True, True])
+
+    def test_the_banner_under_a_prompt_that_opens_with_a_call(self):
+        for prompt in ["❯ retry(3) is what I meant, not retry(1)",
+                       "> retry(3) is what I meant, not retry(1)",
+                       "  retry(3) is what I meant, not retry(1)"]:
+            with self.subTest(prompt=prompt):
+                found = cr.find_limit(prompt + "\n" + self.BANNER
+                                      + "\n     /upgrade to increase your usage limit.")
+                self.assertIsNotNone(found)
+                self.assertIn("resets 3:40pm", found)
+
+
+class TestARealBannerIsNeverACall(unittest.TestCase):
+    def test_the_banners_this_machine_has_seen(self):
+        for text in SCREEN_BANNERS:
+            with self.subTest(text=text):
+                self.assertIsNotNone(cr.find_limit(text))
+                self.assertNotIn(True, cr.tool_echo_mask(text.split("\n")))
+
+    def test_after_a_tool_call_that_has_finished(self):
+        # The limit lands mid-turn: the last thing above it is a tool's block,
+        # and the blank row between the two is what ends that block.
+        above = "⏺ Bash(make test)\n  ⎿  ok\n\n"
+        for text in SCREEN_BANNERS:
+            with self.subTest(text=text):
+                self.assertIsNotNone(cr.find_limit(above + text))
+
+    def test_whatever_is_drawn_in_front_of_it(self):
+        for lead in ["", "  ", "⎿  ", "⏺ ", "● ", "• ", "■ ", "⚠ ", "* ", "- "]:
+            for text in LIVE_BANNERS:
+                with self.subTest(lead=lead, text=text):
+                    self.assertIsNotNone(cr.find_limit(lead + text))
+
+    def test_a_space_the_renderer_dropped_does_not_make_it_one(self):
+        # A gap is a cursor move as often as it is a space, and the move is
+        # gone by the time the row is read: "launched (↓ to manage)" arrives as
+        # "launched(↓ to manage)". A banner that lost the space in front of its
+        # bracket is still a banner.
+        for text in ["You've hit your session limit · resets 3pm(Europe/Warsaw)",
+                     "5-hour limit reached(resets 3pm)",
+                     "Usage limit reached(resets at 3pm)"]:
+            with self.subTest(text=text):
+                self.assertIsNotNone(cr.find_limit(text))
+
+    def test_an_error_is_the_app_reporting_not_a_tool(self):
+        # A failure reported with a bracket — "API Error (529 …" with its gap
+        # dropped, an exception printed whole — opens with `word(` too. No tool
+        # is called …Error, and a bullet in front does not make it one.
+        refusal = 'APIError(529 {"type":"error","error":{"type":"overloaded_error"}})'
+        for lead in ["", "⏺", "⏺ ", "⎿  "]:
+            with self.subTest(lead=lead):
+                self.assertEqual(cr.tool_echo_mask([lead + refusal]), [False])
+                self.assertIsNotNone(cr.find_stall(lead + refusal))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
