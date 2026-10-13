@@ -652,7 +652,7 @@ class TestWaitScale(unittest.TestCase):
 CTX = dict(
     context_tokens=500000, context_window="1M",
     context_env_max=0, context_no_1m=False,
-    handoff_file="H.md", handoff_marker="HANDOFF", handoff_min_bytes=20,
+    handoff_file="/proj/H.md", handoff_marker="HANDOFF", handoff_min_bytes=20,
     handoff_attempts=2,
     handoff_msg="Fold into `{file}` and end it with {marker}.",
     clear_cmd="/clear", resume_msg="Read `{file}` and continue from it.",
@@ -663,7 +663,7 @@ CTX = dict(
 MINE = "/proj/mine.jsonl"          # the transcript this terminal's session writes
 AFTER = "/proj/after.jsonl"        # the fresh transcript /clear starts in its place
 FULL = 700000                      # past the 500k threshold
-RESUME = "Read `H.md` and continue from it."
+RESUME = "Read `/proj/H.md` and continue from it."
 
 
 class Handoff:
@@ -2468,6 +2468,32 @@ class TestTheIdPlaceholder(unittest.TestCase):
     def test_a_plain_path_is_left_untouched(self):
         ctl = restart_controller(handoff_file="H.md")
         self.assertTrue(ctl.handoff_path.endswith("H.md"), ctl.handoff_path)
+
+
+class TestThePhrasesNameTheFileAbsolutely(unittest.TestCase):
+    """A relative CR_HANDOFF_FILE is resolved by the model, not by the wrapper,
+    and the two need not agree: told to write `scratchpad/RESUME-x.md`, claude
+    put it in its own per-session scratchpad under /tmp, six times, while the
+    wrapper probed `<cwd>/scratchpad/` and switched the restart off. Every
+    phrase now carries the one path `probe` is asked about."""
+
+    def test_the_folding_phrase_names_the_path_that_is_probed(self):
+        ctl = restart_controller(handoff_file="scratchpad/RESUME-{id}.md",
+                                 handoff_msg="write `{file}` then {marker}")
+        ctl._send_handoff(0, fresh=True)
+        self.assertTrue(os.path.isabs(ctl.handoff_path), ctl.handoff_path)
+        self.assertIn("`%s`" % ctl.handoff_path, ctl.handoff_text)
+
+    def test_the_resume_and_cancel_phrases_name_it_too(self):
+        ctl = restart_controller(handoff_file="scratchpad/RESUME-{id}.md",
+                                 resume_msg="read `{file}`",
+                                 cancel_msg="forget `{file}`")
+        self.assertEqual(ctl.resume_text, "read `%s`" % ctl.handoff_path)
+        self.assertEqual(ctl.cancel_text, "forget `%s`" % ctl.handoff_path)
+
+    def test_an_absolute_path_is_passed_through_as_it_was_given(self):
+        ctl = restart_controller(handoff_file="/var/tmp/H.md", resume_msg="read `{file}`")
+        self.assertEqual(ctl.resume_text, "read `/var/tmp/H.md`")
 
 
 class TestHandoffRegistry(unittest.TestCase):

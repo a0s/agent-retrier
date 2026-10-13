@@ -80,7 +80,7 @@
 
 set -u
 
-CR_VERSION="3.0.2"
+CR_VERSION="3.0.3"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.
@@ -3513,8 +3513,13 @@ class Controller:
         if "{id}" in cfg["handoff_file"]:
             cfg["handoff_file"] = cfg["handoff_file"].replace("{id}", self.session_id)
         self.handoff_path = os.path.abspath(cfg["handoff_file"])
-        self.resume_text = cfg["resume_msg"].replace("{file}", cfg["handoff_file"])
-        self.cancel_text = cfg["cancel_msg"].replace("{file}", cfg["handoff_file"])
+        # Every phrase names the file by the same absolute path this side
+        # probes. A relative one is resolved by the model, not by us, and it
+        # has its own ideas about where `scratchpad/...` lives: claude wrote
+        # six complete handoffs into its per-session scratchpad under /tmp
+        # while the wrapper watched an empty directory in the project.
+        self.resume_text = cfg["resume_msg"].replace("{file}", self.handoff_path)
+        self.cancel_text = cfg["cancel_msg"].replace("{file}", self.handoff_path)
         self.context_tokens = None    # what the session's last turn was sent with
         self.context_model = None
         self.context_window_hint = None   # a window the transcript states outright
@@ -5060,7 +5065,7 @@ class Controller:
         self.handoff_verified_at = None   # a fresh nonce means a fresh proof, too
         self._handoff_verified_st = None
         text = (self.cfg["handoff_msg"]
-                .replace("{file}", self.cfg["handoff_file"])
+                .replace("{file}", self.handoff_path)
                 .replace("{marker}", self.nonce))
         # A fresh nonce means a fresh phrase, so the proof that THIS one reached
         # the session starts over too -- the echo (if any) still in the

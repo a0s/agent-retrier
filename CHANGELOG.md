@@ -7,6 +7,19 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.0.3] - 2026-10-13
+
+### Fixed
+- The folding, resume and cancel phrases now name the handoff file by its
+  absolute path. A relative `CR_HANDOFF_FILE` used to be typed into the session
+  as written, leaving the model to decide what it was relative to — and with
+  `scratchpad/RESUME-{id}.md` claude wrote every handoff into its own
+  per-session scratchpad under `/tmp` while the wrapper watched
+  `<cwd>/scratchpad/`. Each fold then failed with "the handoff file was never
+  written", and after three of them the frequency guard switched the restart
+  off for the rest of the session (`restart off` in the corner). `{file}` in
+  your own phrases is substituted the same way; nothing in the config changes.
+
 ## [3.0.2] - 2026-10-05
 
 ### Fixed

@@ -71,7 +71,10 @@ export CR_RESUME_MSG='Read `{file}` and carry on from it.'
 Put those three in your shell rc, or in a `direnv` file for one repo, and there
 is nothing else to run. Write `{file}` rather than the literal path in both
 phrases — it is substituted with whatever `CR_HANDOFF_FILE` actually resolves
-to, which is not always the path you set (see below).
+to, which is not always the path you set (see below). What the session is told
+is always the absolute path, even when you set a relative one: a model asked to
+write `scratchpad/RESUME.md` may decide that means a scratchpad of its own
+somewhere else, and the wrapper only ever looks in the one place.
 
 Add the handoff file to your `.gitignore`. It is a scratch note about one
 session and it is rewritten from scratch every time.

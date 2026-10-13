@@ -475,7 +475,7 @@ class TestStalling(unittest.TestCase):
 RESTART = dict(
     context_tokens=0, context_window="auto",
     context_env_max=0, context_no_1m=False,
-    handoff_file="H.md", handoff_marker="HANDOFF", handoff_min_bytes=20,
+    handoff_file="/proj/H.md", handoff_marker="HANDOFF", handoff_min_bytes=20,
     handoff_attempts=2,
     handoff_msg="Fold into `{file}` and end it with {marker}.",
     clear_cmd="/clear", resume_msg="Read `{file}` and continue from it.",
@@ -798,7 +798,7 @@ class TestACodexRestart(unittest.TestCase):
         self.assertEqual(ctl.rstate, cr.CLEARED)
 
         # ...and it answers small.
-        self.assertEqual(ctl.tick(74)[1], "Read `H.md` and continue from it.")
+        self.assertEqual(ctl.tick(74)[1], "Read `/proj/H.md` and continue from it.")
         feed(ctl, 80, path="/codex/sessions/rollout-new.jsonl", turn="open", window=WINDOW)
         feed(ctl, 82, path="/codex/sessions/rollout-new.jsonl", tokens=14000)
         action = ctl.tick(83)
@@ -829,7 +829,7 @@ class TestACodexRestart(unittest.TestCase):
         self.assertIsNone(ctl.tick(76))           # 5s quiet: settled
         self.assertEqual(ctl.rstate, cr.CLEARED)
         self.assertIsNone(ctl.tick(78))           # step_gap(3) since settling not up yet
-        self.assertEqual(ctl.tick(79)[1], "Read `H.md` and continue from it.")
+        self.assertEqual(ctl.tick(79)[1], "Read `/proj/H.md` and continue from it.")
 
     def test_an_open_turn_holds_the_fold_back_however_quiet_it_is(self):
         # A root waiting on its agents writes nothing for minutes. The byte
