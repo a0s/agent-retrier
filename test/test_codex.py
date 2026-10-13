@@ -21,8 +21,8 @@ import tempfile
 import time
 import unittest
 
-from helper import load
-from test_pty import PtyTestCase, Session
+from helper import LEFT_ALONE, hermetic_env, load, restart_timers
+from test_pty import PtyTestCase, Session, USAGE_DOWN
 
 cr = load()
 
@@ -502,6 +502,12 @@ def codex_controller(agent="codex", **over):
     cfg = dict(CFG)
     cfg.update(RESTART)
     cfg.update(over)
+    # A codex controller that completes a fold writes down what it cost, and
+    # one whose config names no file for that falls back to the developer's
+    # real ~/.agent-retrier/folds.json — whatever the environment says. Every
+    # run of this file used to leave a few "folds" there, 1000 tokens each and
+    # dated 1970. The file `load()` gave the implementation instead will do.
+    cfg.setdefault("codex_folds_file", cr.CFG["codex_folds_file"])
     logs = []
     hand = Handoff()
     ctl = cr.Controller(cr.agent_cfg(cfg, agent), logs.append, now=0, probe=hand)
@@ -1307,6 +1313,7 @@ class TestCodexSubcommands(unittest.TestCase):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("CR_")
                and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+        env.update(hermetic_env(self.dir))
         env.update({"CR_CLAUDE_BIN": FAKE_CODEX, "CR_LOG": self.log,
                     "CODEX_HOME": self.dir, "CR_NOTIFY": "0"})
         return subprocess.run([os.path.join(ROOT, "agent-retrier.sh"), *args],
@@ -1343,6 +1350,7 @@ class TestCodexSubcommands(unittest.TestCase):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("CR_")
                and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+        env.update(hermetic_env(self.dir))
         env.update({"CR_CLAUDE_BIN": FAKE_CODEX, "CR_LOG": self.log,
                     "CODEX_HOME": self.dir, "CR_NOTIFY": "0"})
         proc = subprocess.Popen([os.path.join(ROOT, "agent-retrier.sh"), *args],
@@ -1529,12 +1537,29 @@ class TestCodexEndToEnd(PtyTestCase):
         while time.time() < deadline:
             if needle in self.logged():
                 return True
-            session.drain(0.3)
+            session.drain(0.05)
         return False
+
+    def logged_by(self, session):
+        """One wrapper's own lines, when two of them share this test's log."""
+        tag = "[cr %d " % session.proc.pid
+        return "\n".join(l for l in self.logged().splitlines() if tag in l)
+
+    def caught_up(self, s):
+        """Whatever the fake has written to its rollout, the wrapper has now
+        read: one poll interval, so that the next turn of its loop has to
+        poll, and then a line it can only answer by taking that turn (see
+        `Session.roundtrip`). Whatever it made of what it read is in the log.
+        """
+        time.sleep(0.2)                     # CR_POLL_SEC, as `env` sets it
+        self.assertTrue(s.roundtrip(), s.buf[-500:])
 
     def test_a_capacity_error_is_answered_with_the_message(self):
         s = self.session(env=self.env(FAKE_STALL=CAPACITY), cwd=self.work)
         self.assertTrue(s.read_until("GOT:continue", timeout=25))
+        # The two lines the "left alone" tests below look for and must not find.
+        self.assertIn("stall detected (transcript)", self.logged())
+        self.assertIn("sending retry", self.logged())
 
     def test_the_agent_is_worked_out_from_the_command(self):
         s = self.session(env=self.env(FAKE_STALL=CAPACITY), cwd=self.work)
@@ -1555,16 +1580,26 @@ class TestCodexEndToEnd(PtyTestCase):
         # it would type into a session that never stopped.
         s = self.session(env=self.env(FAKE_STALL=CAPACITY, FAKE_SUBAGENT="1"),
                          cwd=self.work)
-        s.read_until("ready", timeout=10)
-        s.drain(4)
+        self.assertTrue(s.read_until("ready", timeout=10))
+        # The fake writes the refused turn before it reads its first line, so
+        # an answer to anything means the row is in the rollout — and the
+        # second answer, a poll later, that the wrapper has been past it. A
+        # wrapper that took it for its own has said so by now; the nudge it
+        # would then type is still a second away, which is why this looks at
+        # the decision and not at the keystrokes.
+        self.assertTrue(s.roundtrip(), s.buf[-500:])
+        self.caught_up(s)
+        self.assertNotIn("stall detected", self.logged())
         self.assertNotIn("GOT:continue", s.buf)
 
     def test_an_ordinary_session_is_left_alone(self):
         s = self.session(env=self.env(), cwd=self.work)
-        s.read_until("ready", timeout=10)
+        self.assertTrue(s.read_until("ready", timeout=10))
         s.send("hello there\r")
         self.assertTrue(s.read_until("GOT:hello there", timeout=10))
-        s.drain(3)
+        self.caught_up(s)
+        for decision in ("stall detected", "limit detected", "sending retry"):
+            self.assertNotIn(decision, self.logged())
         self.assertNotIn("GOT:continue", s.buf)
 
     def restart_env(self, **over):
@@ -1572,16 +1607,18 @@ class TestCodexEndToEnd(PtyTestCase):
         # actually arms every test in this class (they all run codex, never
         # claude) — 135200 is 50% of the 258,400 default FAKE_WINDOW, by the
         # same base+(window-base)*pct/100 formula the old percentage used.
-        e = {"CR_CODEX_CONTEXT_TOKENS": "135200",
-             "CR_HANDOFF_FILE": "handoff.md",
-             "CR_ROOT_IDLE_SEC": "1",
-             "CR_HANDOFF_TIMEOUT_SEC": "45",
-             "CR_STEP_GAP_SEC": "0.5",
-             "CR_VERIFY_SEC": "8",
-             "CR_SLASH_GAP_SEC": "0.2",
-             "CR_SLASH_ENTER_GAP_SEC": "0.2",
-             "FAKE_USAGE": "200000",
-             "FAKE_USAGE_DELAY": "1.0"}
+        #
+        # CR_CLEAR_SETTLE_SEC is codex's alone, and is the one clock here with
+        # no claude counterpart: nothing names codex a new session after
+        # `/clear`, so the screen going quiet for this long is the only
+        # confirmation the wrapper ever gets, and at the 5s default every
+        # restart in this class sat it out in full. It has to stay longer than
+        # the two Enters a slash command takes to go out (CR_SLASH_GAP_SEC +
+        # CR_SLASH_ENTER_GAP_SEC, 0.2s), or the screen would be called quiet
+        # before the command was submitted at all.
+        e = restart_timers(CR_CODEX_CONTEXT_TOKENS="135200",
+                           CR_CLEAR_SETTLE_SEC="0.6",
+                           FAKE_USAGE="200000")
         e.update(over)
         return self.env(**e)
 
@@ -1602,11 +1639,6 @@ class TestCodexEndToEnd(PtyTestCase):
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertIn("context restart armed", self.logged())
         self.assertIn("135200 tokens", self.logged())
-        # Read it through to the end. Torn down mid-restart, the wrapper is
-        # killed holding output nobody read, and on macOS the kernel keeps a
-        # process that exits that way until the terminal drains (see
-        # Session.wait) — longer than close() waits for it.
-        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
 
     def test_codex_resume_msg_can_be_overridden_for_codex_alone(self):
         # The env var has to survive the round trip through the bash wrapper —
@@ -1656,10 +1688,6 @@ class TestCodexEndToEnd(PtyTestCase):
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertIn("restarting at 194k", self.logged())   # cap(258k) - reserve(64k)
         self.assertNotIn("using 194k instead", self.logged())   # nothing needed clamping
-        # Read it through to the end — see test_codex_has_a_threshold_of_its_own
-        # above for why: torn down mid-restart, the kernel can hold the killed
-        # process past what close() waits for.
-        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
 
     # A per-model override's own round trip through bash is covered by the
     # claude version above (test_a_per_model_override_is_read_straight_from_the_
@@ -1675,15 +1703,24 @@ class TestCodexEndToEnd(PtyTestCase):
         # shared percentage to inherit — this session runs codex, and codex
         # alone is what must stay off.
         s = self.session(env=self.restart_env(CR_CONTEXT_TOKENS="135200",
-                                              CR_CODEX_CONTEXT_TOKENS=""),
+                                              CR_CODEX_CONTEXT_TOKENS="",
+                                              FAKE_BANNER=USAGE_DOWN),
                          cwd=self.work)
-        s.read_until("ready", timeout=10)
-        s.drain(6)
+        # 200k of usage is on file, well past claude's 135200 — and from the
+        # moment the second copy of it lands, a wrapper that had armed itself
+        # is LEFT_ALONE away from having typed the fold.
+        self.assertTrue(s.read_until(USAGE_DOWN, timeout=10), s.buf[-500:])
+        s.drain(LEFT_ALONE)
         self.assertNotIn("GOT:handoff", s.buf)
         self.assertNotIn("context restart armed", self.logged())
+        self.assertNotIn("folding up", self.logged())
 
     def test_nothing_is_cleared_while_the_folding_turn_is_still_open(self):
-        s = self.session(env=self.restart_env(FAKE_TURN_HOLD="5"), cwd=self.work)
+        # The handoff file is whole and the rollout then says nothing for three
+        # times CR_ROOT_IDLE_SEC — everything but the turn's own ending says
+        # the fold is done. That ratio is what the hold is for; its length is
+        # not, and at 5s it was mostly a wait.
+        s = self.session(env=self.restart_env(FAKE_TURN_HOLD="1.5"), cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertTrue(s.read_until("GOT:turn-closed", timeout=15), s.buf[-500:])
         before = s.buf.index("GOT:turn-closed")
@@ -1696,8 +1733,14 @@ class TestCodexEndToEnd(PtyTestCase):
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertTrue(self.wait_for_log("stop_reason=aborted", s), self.logged())
-        s.drain(3)
+        # What the wrapper does INSTEAD of clearing: it calls the fold off, in
+        # words, and that is the last thing it types. The fake answers lines in
+        # the order they were typed, so by the time it has answered this one a
+        # `/clear` sent ahead of it would be on screen too.
+        self.assertTrue(s.read_until("GOT:The context restart was cancelled", timeout=15),
+                        s.buf[-500:])
         self.assertNotIn("GOT:/clear", s.buf)
+        self.assertNotIn("clearing the context", self.logged())
 
     def test_codex_is_started_with_its_own_compaction_held_back(self):
         s = self.session(env=self.restart_env(FAKE_USAGE="1000"), cwd=self.work)
@@ -1711,10 +1754,12 @@ class TestCodexEndToEnd(PtyTestCase):
                         self.logged())
 
     def test_codex_getting_there_first_is_logged(self):
-        s = self.session(env=self.restart_env(FAKE_USAGE="1000", FAKE_COMPACT="1"),
+        s = self.session(env=self.restart_env(FAKE_USAGE="1000", FAKE_COMPACT="1",
+                                              FAKE_BANNER=USAGE_DOWN),
                          cwd=self.work)
-        s.read_until("ready", timeout=10)
-        s.drain(2)
+        # The count first, so that there is a thread for codex to compact: the
+        # fake has written it by the time it says so.
+        self.assertTrue(s.read_until(USAGE_DOWN, timeout=10), s.buf[-500:])
         s.send("compact\r")
         self.assertTrue(self.wait_for_log("compacted the thread on its own", s),
                         self.logged())
@@ -1724,9 +1769,9 @@ class TestCodexEndToEnd(PtyTestCase):
             env=self.env(CR_CODEX_CONTEXT_TOKENS="135200", FAKE_USAGE="1000",
                         FAKE_WINDOW="400000"),
             cwd=self.work)
-        s.read_until("ready", timeout=10)
-        s.drain(4)
-        self.assertIn("400k context window (the transcript)", self.logged())
+        self.assertTrue(s.read_until("ready", timeout=10))
+        self.assertTrue(self.wait_for_log("400k context window (the transcript)", s),
+                        self.logged())
 
     def test_only_the_session_above_threshold_gets_a_fold(self):
         # Two wrapped codex processes, same cwd, same CODEX_HOME (T03): the
@@ -1740,12 +1785,18 @@ class TestCodexEndToEnd(PtyTestCase):
         self.assertTrue(quiet.read_until("ready", timeout=10))
         busy = self.session(env=self.restart_env(), cwd=self.work)
         self.assertTrue(busy.read_until("GOT:handoff", timeout=30), busy.buf[-500:])
-        quiet.drain(3)
+        # Both wrappers were watching the same climbing count go quiet, on the
+        # same clocks, so the moment busy decided to fold is the moment quiet
+        # would have — and busy's phrase has since taken 0.6s to be typed and
+        # answered. What is left to wait out is how far apart two loops can
+        # reach the same decision (a poll and a turn, 0.35s), several times.
+        quiet.drain(1.5)
         self.assertNotIn("GOT:handoff", quiet.buf)
-        # Read it through to the end -- see test_codex_has_a_threshold_of_its_own
-        # for why: torn down mid-restart, the kernel can hold the killed
-        # process past what close() waits for.
-        self.assertTrue(busy.read_until("GOT:resume", timeout=30), busy.buf[-500:])
+        # Not that quiet happened to be looking at its own rollout: that it
+        # saw two, could not tell them apart, and said so.
+        self.assertIn("more than one candidate rollout", self.logged_by(quiet))
+        self.assertNotIn("folding up", self.logged_by(quiet))
+        self.assertIn("folding up", self.logged_by(busy))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 pid). It reads real `/proc`, so the platform it is authoritative on (Linux) is
 faked here rather than required to run this file at all.
 """
+import contextlib
 import importlib.util
 import io
 import os
@@ -72,6 +73,35 @@ class TestFindOrphans(unittest.TestCase):
              mock.patch("builtins.open", fake.open_environ), \
              mock.patch.object(check_orphans.os, "getpid", return_value=999):
             self.assertEqual(check_orphans.main(), 1)
+
+    def test_a_process_on_its_way_out_is_given_the_time_to_go(self):
+        # There at the first look, gone by the second: a fake that had been
+        # hung up on and had not finished dying. Not an orphan.
+        fake = FakeProc({222: b"CR_CLAUDE_ARGV=x\x00"})
+        looks = []
+
+        def listdir(path):
+            looks.append(path)
+            return fake.listdir(path) if len(looks) == 1 else []
+
+        with mock.patch.object(check_orphans.os.path, "isdir", fake.isdir), \
+             mock.patch.object(check_orphans.os, "listdir", listdir), \
+             mock.patch("builtins.open", fake.open_environ), \
+             mock.patch.object(check_orphans.os, "getpid", return_value=999), \
+             contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(check_orphans.main(settle=5), 0)
+        self.assertEqual(len(looks), 2)
+        self.assertIn("clean", said.getvalue())
+
+    def test_one_that_stays_is_still_an_orphan_when_the_time_is_up(self):
+        fake = FakeProc({222: b"CR_CLAUDE_ARGV=x\x00"})
+        with mock.patch.object(check_orphans.os.path, "isdir", fake.isdir), \
+             mock.patch.object(check_orphans.os, "listdir", fake.listdir), \
+             mock.patch("builtins.open", fake.open_environ), \
+             mock.patch.object(check_orphans.os, "getpid", return_value=999), \
+             contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual(check_orphans.main(settle=0.3), 1)
+        self.assertIn("[222]", said.getvalue())
 
     def test_main_is_clean_exit_when_nothing_found(self):
         fake = FakeProc({})

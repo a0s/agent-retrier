@@ -288,6 +288,7 @@ class SupervisedCustomCommand(PtyTestCase):
         e.update({
             "CLAUDE_CONFIG_DIR": self.cfg,
             "CR_SCRAPE": "always",
+            "CR_SCRAPE_CONFIRM_SEC": "0.5",   # 3s by default, and nothing here is about it
             "CR_WAIT_SCALE": "3600",     # an hour of waiting becomes a second
             "CR_MARGIN_SEC": "0",
             "CR_USER_IDLE_SEC": "0",

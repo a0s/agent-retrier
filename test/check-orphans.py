@@ -10,9 +10,20 @@ reliably readable from outside it for the same user. There is no portable
 equivalent on macOS, so elsewhere this is a documented no-op rather than a
 false pass — the accurate check runs where CI actually runs: `./test/run.sh
 --docker` (test/run-docker.sh), a Linux container.
+
+    check-orphans.py [SECONDS]
+
+SECONDS is how long something found alive is given to finish dying before it
+is called an orphan. A fake agent is not killed by the test that started it:
+it dies of the hangup its supervisor's death sends it, a moment AFTER the test
+is over. run.sh used to run two more test files between the last pty test and
+this check, which was all the moment it ever needed; now the check comes
+straight after, so it asks for the moment by name. A real orphan is still
+there when it is up.
 """
 import os
 import sys
+import time
 
 
 def find_orphans():
@@ -36,8 +47,12 @@ def find_orphans():
     return orphans
 
 
-def main():
+def main(settle=0.0):
     orphans = find_orphans()
+    deadline = time.time() + settle
+    while orphans and time.time() < deadline:
+        time.sleep(0.1)
+        orphans = find_orphans()
     if orphans is None:
         print("orphan check: skipped (no /proc on this platform)")
         return 0
@@ -49,4 +64,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(float(sys.argv[1]) if len(sys.argv) > 1 else 0.0))

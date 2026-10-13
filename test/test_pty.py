@@ -22,6 +22,7 @@ import tempfile
 import time
 import unittest
 
+from helper import LEFT_ALONE, hermetic_env, restart_timers, roundtrip
 from screen import Screen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,22 +48,51 @@ def _fake_launcher():
 
 FAKE = _fake_launcher()
 
+# The same Badge the supervisor paints with, for the one number of its that a
+# test has to wait out.
+Badge = sys.modules[Screen.__module__].Badge
+
+FRAME_CLOSED = "\x1b[?2026l"     # how claude ends a repaint, and what the overlay keys on
+SAVE_CURSOR = "\x1b7"            # how `annotation_bytes` begins every paint of ours
+
+# Where a session logs when its test did not say. One file per test PROCESS, not
+# one for the machine: `./test/run.sh` runs several of these side by side, and a
+# single file would be all of them interleaved, on top of whatever every earlier
+# run left in it. It is not cleaned up, on purpose — when a test fails, the
+# newest of these is where the wrapper said why.
+LOG = os.path.join(tempfile.gettempdir(), "cr-pty-test.%d.log" % os.getpid())
+
 
 class Session:
     """Runs agent-retrier.sh on a pty we control, the way a terminal emulator would."""
 
-    def __init__(self, env=None, args=(), rows=40, cols=120, cwd=None):
+    def __init__(self, env=None, args=(), rows=40, cols=120, cwd=None, state=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        # `state` stands in for ~/.agent-retrier (see helper.hermetic_env). A
+        # test hands every session it starts the same one, so two of them still
+        # see each other's claims the way two wrappers in one home do; a session
+        # started on its own gets, and afterwards removes, its own.
+        self._own_state = None
+        if state is None:
+            state = self._own_state = tempfile.mkdtemp(prefix="cr-pty-state-")
+        if cwd is None:
+            # Not wherever the suite happens to be standing. That was test/
+            # itself, where a session with a restart armed quietly made a
+            # `.agent-retrier/` for its handoff — in the checkout, which the
+            # Linux run mounts read-only precisely so that nothing can.
+            cwd = os.path.join(state, "cwd")
+            os.makedirs(cwd, exist_ok=True)
         # A test run started from inside a wrapped session would inherit
         # AGENT_RETRIER_ACTIVE=1 (and the caller's tuning), and every wrapper
         # under test would dutifully degrade into a plain exec. Start clean.
         full = {k: v for k, v in os.environ.items()
                 if not k.startswith("CR_")
                 and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+        full.update(hermetic_env(state))
         full.update({
             "CR_CLAUDE_BIN": FAKE,
-            "CR_LOG": os.path.join(tempfile.gettempdir(), "cr-pty-test.log"),
+            "CR_LOG": LOG,
             "CR_NOTIFY": "0",
             "CR_BADGE": "0",             # off unless a test is about the badge
             "PYTHONUNBUFFERED": "1",
@@ -132,21 +162,91 @@ class Session:
         self.proc.kill()
         raise subprocess.TimeoutExpired(self.proc.args, timeout)
 
+    def roundtrip(self, word="tick", timeout=10):
+        return roundtrip(self, word, timeout)
+
     def close(self):
         if self.proc.poll() is None:
             self.proc.kill()
+            # Killed with output nobody read, the wrapper does not finish dying
+            # until the terminal has taken that output off its hands (see
+            # `wait` above), and a plain `proc.wait()` here sat out its whole
+            # timeout and then raised — out of a cleanup, on a test that had
+            # passed. Tests were reading on to the end of a restart they had
+            # stopped caring about purely to keep this from happening.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                self.drain(0.02)
+                try:
+                    self.proc.wait(timeout=0.02)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
             self.proc.wait(timeout=5)
         try:
             os.close(self.master)
         except OSError:
             pass
+        if self._own_state:
+            shutil.rmtree(self._own_state, ignore_errors=True)
+            self._own_state = None
 
 
 class PtyTestCase(unittest.TestCase):
     def session(self, **kw):
+        kw.setdefault("state", self.state())
         s = Session(**kw)
         self.addCleanup(s.close)
         return s
+
+    def state(self):
+        """This test's stand-in for ~/.agent-retrier, made the first time a
+        session is started and shared by every session the test starts."""
+        if getattr(self, "_state", None) is None:
+            self._state = tempfile.mkdtemp(prefix="cr-pty-state-")
+            self.addCleanup(shutil.rmtree, self._state, ignore_errors=True)
+        return self._state
+
+    # A class whose tests read the wrapper's log names the file in `self.log`
+    # (and hands it to the wrapper as CR_LOG); these two are for those.
+    def logged(self):
+        try:
+            with open(self.log) as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def wait_log(self, needle, session, timeout=25):
+        """Wait for a line in the wrapper's log, draining the pty meanwhile.
+
+        Waiting on the log rather than on a fixed number of seconds is what keeps
+        these honest on a loaded runner: the assertion is about what the wrapper
+        decided, not about how long it took to decide it.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if needle in self.logged():
+                return True
+            session.drain(0.05)
+        return needle in self.logged()
+
+    # One whole paint of the badge, as `annotation_bytes` writes it: the mark,
+    # whatever it says, and the cursor handed back.
+    _BADGE = re.compile("[◆◇][^\x1b]*\x1b\\[0m\x1b8")
+
+    def badge_painted(self, session, since=0, timeout=5):
+        """Wait until the badge has been drawn, whole, at or after offset
+        `since` of what the session has printed.
+
+        The badge goes on once claude's output has been quiet for Badge.QUIET,
+        and again after everything claude prints. A test that needs it on
+        screen used to give it a second; this takes as long as it takes.
+        """
+        deadline = time.time() + timeout
+        while not self._BADGE.search(session.buf, since) and time.time() < deadline:
+            session.drain(0.05)
+        self.assertTrue(self._BADGE.search(session.buf, since),
+                        "no badge was painted: %r" % session.buf[since:][-300:])
 
 
 class TestTransparency(PtyTestCase):
@@ -199,7 +299,10 @@ class TestTransparency(PtyTestCase):
         s = self.session(rows=24, cols=80)
         self.assertTrue(s.read_until("winsize 80x24"))
         s.resize(50, 100)
-        time.sleep(0.3)
+        # The wrapper acts on a resize at the top of its loop, so a line typed
+        # straight after one reaches claude a turn AHEAD of the new size. Once
+        # a line has been answered, that turn has been taken.
+        self.assertTrue(s.roundtrip())
         s.send("winsize\r")
         self.assertTrue(s.read_until("winsize 100x50"))
 
@@ -258,16 +361,25 @@ class TestLogTag(PtyTestCase):
 class TestScrapeChannel(PtyTestCase):
     """The fallback channel: the banner is only ever seen on screen."""
 
+    # A scraped banner is acted on once it has stood for CR_SCRAPE_CONFIRM_SEC.
+    # At the 3s default that was most of what every test here spent, and three
+    # of them were asserting "nothing happened" inside a window no longer than
+    # the confirmation itself — which nothing could have failed.
+    CONFIRM = 0.5
+
     def setUp(self):
         self.cfg = tempfile.mkdtemp(prefix="cr-cfg-")
         self.work = tempfile.mkdtemp(prefix="cr-work-")
         self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        self.log = os.path.join(self.cfg, "log")
 
     def env(self, **over):
         e = {
             "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_LOG": self.log,
             "CR_SCRAPE": "always",
+            "CR_SCRAPE_CONFIRM_SEC": str(self.CONFIRM),
             "CR_WAIT_SCALE": "3600",     # an hour of waiting becomes a second
             "CR_MARGIN_SEC": "0",
             "CR_USER_IDLE_SEC": "0",
@@ -276,11 +388,26 @@ class TestScrapeChannel(PtyTestCase):
         e.update(over)
         return e
 
+    def confirmed(self, s):
+        """What is on screen now has stood for CR_SCRAPE_CONFIRM_SEC, and the
+        wrapper has been round its loop since: had it taken any of it for a
+        banner, it has said so in the log by now (see `helper.roundtrip`).
+
+        Called once the text in question has been read off the pty, which is
+        necessarily after the wrapper read it — so this sleep cannot end before
+        the wrapper's own confirmation window does.
+        """
+        time.sleep(self.CONFIRM)
+        self.assertTrue(s.roundtrip(), s.buf[-500:])
+
     def test_a_banner_on_screen_triggers_a_retry(self):
         s = self.session(
             env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours"),
             cwd=self.work)
         self.assertTrue(s.read_until("GOT:continue", timeout=20))
+        # The two lines the tests below look for in the log and must not find.
+        self.assertIn("limit detected (screen)", self.logged())
+        self.assertIn("sending retry", self.logged())
 
     def test_the_message_is_configurable(self):
         s = self.session(
@@ -292,17 +419,27 @@ class TestScrapeChannel(PtyTestCase):
     def test_ordinary_output_triggers_nothing(self):
         s = self.session(
             env=self.env(FAKE_BANNER="all done, no limits here"), cwd=self.work)
-        s.read_until("all done")
-        s.drain(3)
+        self.assertTrue(s.read_until("all done"))
+        self.confirmed(s)
+        self.assertNotIn(" detected (screen)", self.logged())   # limit or stall
         self.assertNotIn("GOT:continue", s.buf)
 
     def test_text_about_a_limit_triggers_nothing(self):
         # A tool render quoting banner text: upstream #63, a 22-hour bogus wait.
+        #
+        # Drawn the way Claude Code draws a tool call — "⏺ Name(" — because that
+        # header is the only thing that says the line after it is a quotation.
+        # This fixture used to open with "*", which `_TOOL_HEADER` does not
+        # know, and a line like that the wrapper takes for a live banner. The
+        # test stayed green because it stopped looking at 3s, which is when
+        # the confirmation ends, and because a wait until "3pm (UTC)" types
+        # nothing for up to 24 (CR_WAIT_SCALE'd) seconds after that.
         s = self.session(
-            env=self.env(FAKE_BANNER='* Bash(grep "hit your session limit - resets 3pm (UTC)" log)'),
+            env=self.env(FAKE_BANNER='⏺ Bash(grep "hit your session limit - resets 3pm (UTC)" log)'),
             cwd=self.work)
-        s.read_until("Bash(grep")
-        s.drain(3)
+        self.assertTrue(s.read_until("Bash(grep"))
+        self.confirmed(s)
+        self.assertNotIn("limit detected", self.logged())
         self.assertNotIn("GOT:continue", s.buf)
 
     def test_the_agent_roster_is_never_scraped(self):
@@ -319,7 +456,8 @@ class TestScrapeChannel(PtyTestCase):
                          FAKE_BANNER="You've hit your session limit - resets in 1 hours"),
             args=["agents"], cwd=self.work)
         self.assertTrue(s.read_until("argv=agents"))
-        s.drain(5)
+        self.assertTrue(s.read_until("session limit"))
+        self.confirmed(s)
         self.assertNotIn("GOT:continue", s.buf)
         with open(log) as fh:
             written = fh.read()
@@ -342,21 +480,37 @@ class TestScrapeChannel(PtyTestCase):
             env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours",
                          FAKE_WORKING="1", CR_BUSY_IDLE_SEC="30"),
             cwd=self.work)
-        s.read_until("Cogitating")
-        s.drain(4)
-        self.assertNotIn("GOT:continue", s.buf)
+        self.assertTrue(s.read_until("Cogitating"))
+        # The wrapper's own account of the moment the reset arrived. The fake
+        # never reads a line while it is "working", so there is no GOT to look
+        # for whatever the wrapper types — this used to assert the absence of
+        # one, and could not have failed. What a keystroke would leave is its
+        # echo: the pty prints back what is typed into it.
+        self.assertTrue(self.wait_log("deferring retry: claude is working", s),
+                        self.logged())
+        self.assertNotIn("sending retry", self.logged())
+        self.assertNotIn("continue", s.buf)
 
     def test_an_unsent_draft_defers_the_retry(self):
+        # The limit lands a second into the session, on someone who is already
+        # halfway through a sentence.
         s = self.session(
             env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours",
-                         CR_USER_IDLE_SEC="0"),
+                         FAKE_DELAY="1", CR_USER_IDLE_SEC="0"),
             cwd=self.work)
-        s.read_until("session limit")
+        self.assertTrue(s.read_until("winsize"))
         s.send("half a thought")            # typed, never submitted
-        s.drain(4)
+        # Not "nothing was typed for four seconds": that was the confirmation
+        # and the wait, to the second, and the draft went out before the gate
+        # was ever asked. This is the gate being asked, and answering.
+        self.assertTrue(self.wait_log("deferring retry: unsent text in the prompt box", s),
+                        self.logged())
+        self.assertNotIn("sending retry", self.logged())
         self.assertNotIn("GOT:continue", s.buf)
         s.send("\r")                        # the human submits it themselves
-        self.assertTrue(s.read_until("GOT:continue", timeout=20))
+        # A deferred retry is looked at again 15s later, and that number is
+        # not ours to shorten (`wake_at = now + 15`, no knob).
+        self.assertTrue(s.read_until("GOT:continue", timeout=30), self.logged())
 
 
 class TestBadge(PtyTestCase):
@@ -380,7 +534,7 @@ class TestBadge(PtyTestCase):
         e.update(env)
         s = self.session(env=e, rows=self.ROWS, cols=self.COLS)
         self.assertTrue(s.read_until("winsize"))
-        s.drain(1.0)                      # let the badge settle after the frame
+        self.badge_painted(s)             # it goes on once the frame has gone quiet
         return s
 
     def test_it_is_painted_in_the_bottom_right_corner(self):
@@ -395,8 +549,10 @@ class TestBadge(PtyTestCase):
         # a line at a time for the rest of the session.
         s = self.running()
         for _ in range(3):
-            s.send("tick\r")
-            s.drain(0.5)
+            self.assertTrue(s.roundtrip())
+            # ...and the badge again, over what that just printed: the repaint
+            # is the write that would scroll the screen, if any did.
+            self.badge_painted(s, since=s.buf.rindex("GOT:"))
         sc = self.screen(s)
         self.assertEqual(sc.scrolled, 0)
         self.assertTrue(sc.line(1).startswith("fake-claude ready"))
@@ -406,7 +562,7 @@ class TestBadge(PtyTestCase):
         s = self.running()
         s.send("hello\r")
         self.assertTrue(s.read_until("GOT:hello"))
-        s.drain(0.5)
+        self.badge_painted(s, since=s.buf.index("GOT:hello"))
         sc = self.screen(s)
         # The reply lands at the start of its own line, where claude's cursor was
         # — not in the corner the badge jumped to.
@@ -419,15 +575,19 @@ class TestBadge(PtyTestCase):
         s = self.running()
         s.send("plain\r")
         self.assertTrue(s.read_until("GOT:plain"))
-        s.drain(0.5)
+        self.badge_painted(s, since=s.buf.index("GOT:plain"))
         sc = self.screen(s)
         self.assertEqual(sc.attr_at(3, 1), "")        # no dim leaking out of DECSC
         self.assertEqual(sc.attr_at(self.ROWS, 116), "2")
 
     def test_it_is_off_when_asked(self):
         s = self.session(env={"CR_BADGE": "0"}, rows=self.ROWS, cols=self.COLS)
-        s.read_until("winsize")
-        s.drain(1.0)
+        self.assertTrue(s.read_until("winsize"))
+        # A badge goes on Badge.QUIET after claude stops printing. Once that
+        # has passed, the next turn of the wrapper's loop is the one that would
+        # paint it — and an answered line is proof that turn was taken.
+        time.sleep(Badge.QUIET)
+        self.assertTrue(s.roundtrip())
         self.assertNotIn("◆", s.buf)
 
     def test_the_corner_is_configurable(self):
@@ -441,8 +601,9 @@ class TestBadge(PtyTestCase):
 
     def test_a_resize_moves_it(self):
         s = self.running()
+        before = len(s.buf)
         s.resize(24, 60)
-        s.drain(1.0)
+        self.badge_painted(s, since=before)
         sc = self.screen(s, rows=24, cols=60)
         self.assertIn("◆ cr", sc.line(24))
         self.assertEqual(sc.cells[23][59], " ")
@@ -453,12 +614,13 @@ class TestBadge(PtyTestCase):
         s = self.running(
             CLAUDE_CONFIG_DIR=tempfile.mkdtemp(prefix="cr-cfg-"),
             CR_SCRAPE="always", CR_WAIT_SCALE="60", CR_MARGIN_SEC="0",
+            CR_SCRAPE_CONFIRM_SEC="0.5",
             FAKE_BANNER="You've hit your session limit - resets in 5 hours")
         self.assertTrue(s.read_until("session limit"))
         countdown = re.compile(r"◆ cr ([1-5])m$")
         deadline = time.time() + 10
         while time.time() < deadline:
-            s.drain(0.5)
+            s.drain(0.1)
             sc = self.screen(s)
             if countdown.search(sc.line(self.ROWS)):
                 break
@@ -535,8 +697,14 @@ class TestAgentOverlay(PtyTestCase):
         s = self.session(env={"CLAUDE_CONFIG_DIR": self.cfg, "FAKE_AGENT_TREE": "1"},
                          cwd=self.work, rows=self.ROWS, cols=self.COLS)
         self.assertTrue(s.read_until("winsize"))
-        s.drain(1.0)
+        # The overlay paints in the same turn of the loop that sees claude
+        # close a frame, so the frame is what to wait for (it is drawn most of
+        # a second in — the old 1.0s here cleared it by a fifth of one), and an
+        # answered line after it is everything that turn wrote.
+        self.assertTrue(s.read_until(FRAME_CLOSED), s.buf[-300:])
+        self.assertTrue(s.roundtrip())
         self.assertNotIn("sonnet-5", s.buf)      # not one extra byte, model or otherwise
+        self.assertNotIn(SAVE_CURSOR, s.buf)     # ...which is how either painter starts one
 
     def test_the_label_returns_after_claude_repaints_the_row(self):
         s = self.running()
@@ -567,7 +735,9 @@ class TestAgentOverlay(PtyTestCase):
             sc = self.screen(s, rows=rows, cols=cols)
             if "sonnet-5/?" in sc.line(self.ROW_A):
                 break
-        s.drain(1.0)      # let the badge settle on its own due() timer too
+        # The tree's last row is drawn over the badge's corner and wipes it;
+        # the badge comes back on its own due() timer, after the frame.
+        self.badge_painted(s, since=s.buf.index(FRAME_CLOSED))
         sc = self.screen(s, rows=rows, cols=cols)
         self.assertIsNotNone(sc)
         self.assertIn("sonnet-5/?", sc.line(self.ROW_A))     # row 10: no collision
@@ -648,8 +818,11 @@ class TestAgentsPanelOverlay(PtyTestCase):
         s = self.session(env={"CLAUDE_CONFIG_DIR": self.cfg, "FAKE_AGENTS_PANEL": "1"},
                          cwd=self.work, rows=self.ROWS, cols=self.COLS)
         self.assertTrue(s.read_until("winsize"))
-        s.drain(1.0)
+        # As for the tree's test of the same name, above.
+        self.assertTrue(s.read_until(FRAME_CLOSED), s.buf[-300:])
+        self.assertTrue(s.roundtrip())
         self.assertNotIn("sonnet-5", s.buf)
+        self.assertNotIn(SAVE_CURSOR, s.buf)
 
     def test_the_label_returns_after_claude_repaints_the_row(self):
         s = self.running()
@@ -735,10 +908,12 @@ class TestTranscriptChannel(PtyTestCase):
         self.work = tempfile.mkdtemp(prefix="cr-work-")
         self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        self.log = os.path.join(self.cfg, "log")
 
     def test_a_rate_limit_record_triggers_a_retry(self):
         s = self.session(env={
             "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_LOG": self.log,
             "CR_SCRAPE": "never",            # prove the transcript alone is enough
             "CR_WAIT_SCALE": "3600",
             "CR_MARGIN_SEC": "0",
@@ -747,6 +922,8 @@ class TestTranscriptChannel(PtyTestCase):
             "FAKE_TRANSCRIPT": "You've hit your weekly limit - resets in 2 hours",
         }, cwd=self.work)
         self.assertTrue(s.read_until("GOT:continue", timeout=25))
+        # The line the two tests below look for in the log and must not find.
+        self.assertIn("sending retry", self.logged())
 
     def test_an_answered_turn_ends_the_wait(self):
         # The account was switched mid-wait (or the plan upgraded, or the quota
@@ -755,6 +932,7 @@ class TestTranscriptChannel(PtyTestCase):
         # a working session and eventually type into it.
         s = self.session(env={
             "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_LOG": self.log,
             "CR_SCRAPE": "never",
             "CR_NOTIFY": "1",
             "CR_WAIT_SCALE": "3600",
@@ -765,7 +943,14 @@ class TestTranscriptChannel(PtyTestCase):
         self.assertTrue(s.read_until("usage limit detected", timeout=15))
         s.send("answer\r")
         self.assertTrue(s.read_until("wait cancelled", timeout=15))
-        s.drain(2)
+        # The retry this wait was counting down to is forty (scaled) seconds
+        # off; no test could sit here long enough to watch it not be typed,
+        # and the two seconds this one used to sit proved nothing either way.
+        # What can be seen is that the wait itself is gone, in the wrapper's
+        # own words, and that a turn of its loop later nothing has gone out.
+        self.assertIn("dropping the wait", self.logged())
+        self.assertTrue(s.roundtrip())
+        self.assertNotIn("sending retry", self.logged())
         self.assertNotIn("GOT:continue", s.buf)
 
     def test_a_live_transcript_turns_the_scraper_off(self):
@@ -774,7 +959,10 @@ class TestTranscriptChannel(PtyTestCase):
         # scraper must stand down rather than double-fire on the render.
         s = self.session(env={
             "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_LOG": self.log,
             "CR_SCRAPE": "auto",
+            "CR_SCRAPE_CONFIRM_SEC": "0.5",  # still several CR_POLL_SECs: time
+                                             # for the transcript to be noticed
             "CR_WAIT_SCALE": "3600",
             "CR_MARGIN_SEC": "0",
             "CR_USER_IDLE_SEC": "0",
@@ -782,9 +970,20 @@ class TestTranscriptChannel(PtyTestCase):
             "FAKE_TRANSCRIPT_PLAIN": "ordinary turn",   # a non-limit record: just growth
             "FAKE_BANNER": "You've hit your session limit - resets in 1 hours",
         }, cwd=self.work)
-        s.read_until("session limit")
-        s.drain(4)
+        self.assertTrue(s.read_until("session limit"))
+        # The banner has stood for its confirmation window and the wrapper has
+        # been round its loop since (see TestScrapeChannel.confirmed): a
+        # scraper that had not stood down has logged the limit by now.
+        time.sleep(0.5)
+        self.assertTrue(s.roundtrip())
+        self.assertNotIn("limit detected", self.logged())
         self.assertNotIn("GOT:continue", s.buf)
+
+
+# Both fakes print FAKE_BANNER after everything they write at startup, the two
+# copies of FAKE_USAGE included — so on a session that scrapes nothing it is a
+# free signal, on the pty, that the usage a test is about is now on file.
+USAGE_DOWN = "usage is on file"
 
 
 class TestContextRestart(PtyTestCase):
@@ -806,47 +1005,14 @@ class TestContextRestart(PtyTestCase):
         self.log = os.path.join(self.cfg, "log")
 
     def env(self, **over):
-        e = {
-            "CLAUDE_CONFIG_DIR": self.cfg,
-            "CR_LOG": self.log,
-            "CR_SCRAPE": "never",
-            "CR_CONTEXT_TOKENS": "510000",        # 510k of a 1M window
-            "CR_HANDOFF_FILE": "handoff.md",
-            "CR_ROOT_IDLE_SEC": "1",
-            "CR_HANDOFF_TIMEOUT_SEC": "45",
-            "CR_STEP_GAP_SEC": "0.5",
-            "CR_VERIFY_SEC": "8",
-            "CR_USER_IDLE_SEC": "0",
-            "CR_POLL_SEC": "0.3",
-            "CR_SLASH_GAP_SEC": "0.2",
-            "CR_SLASH_ENTER_GAP_SEC": "0.2",
-            "FAKE_USAGE": "700000",
-            "FAKE_USAGE_DELAY": "1.0",
-            "FAKE_MODEL": "claude-opus-5",
-        }
+        e = restart_timers(
+            CLAUDE_CONFIG_DIR=self.cfg,
+            CR_LOG=self.log,
+            CR_CONTEXT_TOKENS="510000",           # 510k of a 1M window
+            FAKE_USAGE="700000",
+            FAKE_MODEL="claude-opus-5")
         e.update(over)
         return e
-
-    def logged(self):
-        try:
-            with open(self.log) as fh:
-                return fh.read()
-        except OSError:
-            return ""
-
-    def wait_log(self, needle, session, timeout=25):
-        """Wait for a line in the wrapper's log, draining the pty meanwhile.
-
-        Waiting on the log rather than on a fixed number of seconds is what keeps
-        these honest on a loaded runner: the assertion is about what the wrapper
-        decided, not about how long it took to decide it.
-        """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if needle in self.logged():
-                return True
-            session.drain(0.3)
-        return needle in self.logged()
 
     def test_a_full_context_is_folded_cleared_and_unfolded(self):
         s = self.session(env=self.env(), cwd=self.work)
@@ -862,12 +1028,25 @@ class TestContextRestart(PtyTestCase):
     def test_a_slow_clear_still_finishes_the_restart(self):
         # T08: the resume phrase used to go out CR_STEP_GAP_SEC after `/clear`
         # was TYPED, not after it took hold. fake_claude here does not even
-        # accept it for 4s -- long enough to catch a resume sent too early, and
-        # short enough that the restart still finishes well inside the timeout.
-        s = self.session(env=self.env(FAKE_SCRIPT="delayclear=4"), cwd=self.work)
+        # accept it for 1.5s -- several times the 0.2s step gap, so a resume
+        # sent on the old schedule lands well inside the stall, and well short
+        # of the two things that would make this a different test:
+        # CR_VERIFY_SEC (8s), past which `/clear` is typed a second time, and
+        # CR_CLEAR_SETTLE_SEC, past which a screen that has merely gone quiet
+        # is taken for confirmation without the new session ever showing up.
+        s = self.session(env=self.env(FAKE_SCRIPT="delayclear=1.5",
+                                      CR_CLEAR_SETTLE_SEC="10"),
+                         cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
         self.assertTrue(self.wait_log("context restarted", s), self.logged())
+        # The fake answers lines in order, so a resume typed too early is still
+        # answered, after the clear, and all of the above would pass. What
+        # tells the two apart is what the wrapper says released the resume:
+        # the new session, and not a timer or a second `/clear`.
+        log = self.logged()
+        self.assertIn("the clear took hold (a new session replaced it)", log)
+        self.assertNotIn("the clear command left no trace", log)
 
     def test_a_clear_rebinds_the_watcher_and_unfold_lands_in_the_new_file(self):
         # T02 AC: `/clear` moves the session's identity, and the watcher has to
@@ -902,16 +1081,33 @@ class TestContextRestart(PtyTestCase):
         # empty box when it does not, and an empty box submits nothing.
         s = self.session(env=self.env(), cwd=self.work)
         self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
-        s.drain(2)
+        # The restart is over, so the wrapper has typed all it is going to; and
+        # the fake answers in the order it was typed to, so once it has
+        # answered a line of ours, it has answered every Enter that came first.
+        self.assertTrue(self.wait_log("context restarted", s), self.logged())
+        self.assertTrue(s.roundtrip())
         self.assertEqual(s.buf.count("GOT:/clear"), 1)
+
+    def called_off(self, s):
+        """The wrapper has given the fold up, and said so to the session.
+
+        That phrase is what it types INSTEAD of `/clear`, and it is the last
+        thing it types: the restart is over the moment it goes out. The fake
+        answers in the order it was typed to, so once this has its answer a
+        `/clear` sent ahead of it would have had one too — which is the whole
+        of what three seconds of watching the screen used to establish.
+        """
+        self.assertTrue(s.read_until("GOT:The context restart was cancelled", timeout=15),
+                        self.logged())
 
     def test_a_handoff_that_never_arrives_never_clears_anything(self):
         s = self.session(env=self.env(FAKE_HANDOFF="none", CR_HANDOFF_ATTEMPTS="1"),
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertTrue(self.wait_log("never written", s), self.logged())
-        s.drain(3)
+        self.called_off(s)
         self.assertNotIn("GOT:/clear", s.buf)
+        self.assertNotIn("clearing the context", self.logged())
         self.assertFalse(os.path.exists(os.path.join(self.work, "handoff.md")))
 
     def test_a_handoff_that_stops_before_the_marker_never_clears_anything(self):
@@ -919,35 +1115,53 @@ class TestContextRestart(PtyTestCase):
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertTrue(self.wait_log("does not end with", s), self.logged())
-        s.drain(3)
+        self.called_off(s)
         self.assertNotIn("GOT:/clear", s.buf)
+        self.assertNotIn("clearing the context", self.logged())
 
     def test_a_lost_fold_phrase_is_retyped_and_the_restart_still_completes(self):
         # T06: the first attempt is swallowed as if it never reached the
         # session at all -- no file, no transcript row, no GOT reply. Nothing
         # but the wrapper's own no-echo timeout (CR_VERIFY_SEC) can notice that
         # and retype it; the second attempt is the one fake_claude answers.
-        s = self.session(env=self.env(FAKE_SCRIPT="dropfirstfold"), cwd=self.work)
+        #
+        # That timeout is the one thing this test sits out in full, so it is
+        # the one place it is worth shortening: 3s is still several times the
+        # 0.6s a typed phrase takes to be submitted and echoed, which is what
+        # keeps the SECOND attempt from being called lost as well.
+        s = self.session(env=self.env(FAKE_SCRIPT="dropfirstfold", CR_VERIFY_SEC="3"),
+                         cwd=self.work)
         self.assertTrue(self.wait_log("left no trace", s, timeout=20), self.logged())
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
         self.assertTrue(self.wait_log("context restarted", s), self.logged())
 
     def test_a_session_under_the_threshold_is_left_alone(self):
-        s = self.session(env=self.env(FAKE_USAGE="200000"), cwd=self.work)
-        self.assertTrue(s.read_until("ready"))
-        s.drain(6)
+        s = self.session(env=self.env(FAKE_USAGE="200000", FAKE_BANNER=USAGE_DOWN),
+                         cwd=self.work)
+        # Both copies of the usage row are on file, and the wrapper has read
+        # the figure (it prints the threshold the moment it has a model to
+        # hold it against). From here a session it meant to fold is LEFT_ALONE
+        # away from being typed into.
+        self.assertTrue(s.read_until(USAGE_DOWN), s.buf[-500:])
+        self.assertTrue(self.wait_log("restarting at 510k", s), self.logged())
+        s.drain(LEFT_ALONE)
+        self.assertNotIn("folding up", self.logged())
         self.assertNotIn("GOT:handoff", s.buf)
         self.assertNotIn("GOT:/clear", s.buf)
 
     def test_the_feature_stays_off_until_it_is_switched_on(self):
         # The whole point of the default: nobody upgrading this package should
         # find their session being cleared for them.
-        s = self.session(env=self.env(CR_CONTEXT_TOKENS="0"), cwd=self.work)
-        self.assertTrue(s.read_until("ready"))
-        s.drain(6)
+        s = self.session(env=self.env(CR_CONTEXT_TOKENS="0", FAKE_BANNER=USAGE_DOWN),
+                         cwd=self.work)
+        # 700k of a 1M window is on file. Switched on, this is the session the
+        # first test in this class folds; LEFT_ALONE later it would have been.
+        self.assertTrue(s.read_until(USAGE_DOWN), s.buf[-500:])
+        s.drain(LEFT_ALONE)
         self.assertNotIn("GOT:handoff", s.buf)
         self.assertNotIn("context restart armed", self.logged())
+        self.assertNotIn("folding up", self.logged())
 
     def test_the_restart_flag_turns_it_on_at_the_default_percentage(self):
         # No CR_CONTEXT_TOKENS of its own — CR_CONTEXT_RESTART alone has to be
@@ -975,14 +1189,25 @@ class TestContextRestart(PtyTestCase):
         # session runs, not just for the one notify() line Claude's own repaint
         # erases within a frame. FAKE_USAGE_AFTER equal to FAKE_USAGE means the
         # context claude reports right after `/clear` never actually fell.
-        s = self.session(env=self.env(CR_BADGE="1", FAKE_USAGE_AFTER="700000"),
+        #
+        # The verdict comes CR_VERIFY_SEC after the resume phrase: that is how
+        # long the wrapper gives the context to fall before saying it did not.
+        # Nothing else in this test is waiting for anything, so that is 3s
+        # here, not the 8 the other restarts keep in hand.
+        s = self.session(env=self.env(CR_BADGE="1", FAKE_USAGE_AFTER="700000",
+                                      CR_VERIFY_SEC="3"),
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
         self.assertTrue(self.wait_log("not attempting another this session", s),
                         self.logged())
-        s.drain(1.0)
         sc = Screen(40, 120)
-        sc.feed(s.buf)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            sc = Screen(40, 120)
+            sc.feed(s.buf)
+            if "restart off" in sc.line(40):
+                break
+            s.drain(0.05)
         self.assertIn("restart off", sc.line(40))
 
     def test_an_at_file_mention_resume_phrase_is_delivered_whole(self):
@@ -1027,21 +1252,6 @@ class TestClaudesStatusLineProxy(PtyTestCase):
         e.update(over)
         return e
 
-    def logged(self):
-        try:
-            with open(self.log) as fh:
-                return fh.read()
-        except OSError:
-            return ""
-
-    def wait_log(self, needle, session, timeout=20):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if needle in self.logged():
-                return True
-            session.drain(0.3)
-        return needle in self.logged()
-
     def _user_statusline_script(self):
         """A stand-in for a person's own statusLine command: reads the same
         JSON any statusline command gets and prints one recognisable line,
@@ -1057,21 +1267,21 @@ class TestClaudesStatusLineProxy(PtyTestCase):
         return path
 
     def test_settings_names_the_proxy_once_a_restart_is_armed(self):
+        # The fake prints its argv on the "ready" line and the window size on
+        # the next: once "winsize" has arrived, the whole of argv has.
         s = self.session(env=self.env(), cwd=self.work)
-        self.assertTrue(s.read_until("ready"))
+        self.assertTrue(s.read_until("winsize"))
         self.assertIn('"statusLine"', s.buf)
         self.assertIn("--cr-statusline", s.buf)
 
     def test_without_a_restart_armed_nothing_is_added(self):
         s = self.session(env=self.env(CR_CONTEXT_TOKENS="0"), cwd=self.work)
-        self.assertTrue(s.read_until("ready"))
-        s.drain(1)
+        self.assertTrue(s.read_until("winsize"))
         self.assertNotIn("--settings", s.buf)
 
     def test_the_off_switch_stops_settings_being_added_at_all(self):
         s = self.session(env=self.env(CR_STATUSLINE_PROXY="0"), cwd=self.work)
-        self.assertTrue(s.read_until("ready"))
-        s.drain(1)
+        self.assertTrue(s.read_until("winsize"))
         self.assertNotIn("--settings", s.buf)
 
     def test_the_statusline_report_overrides_the_1m_model_table(self):
@@ -1096,7 +1306,7 @@ class TestClaudesStatusLineProxy(PtyTestCase):
                                       "command": "%s %s" % (sys.executable, script)}}, fh)
         s = self.session(env=self.env(FAKE_STATUSLINE_RUN="1"), cwd=self.work)
         self.assertTrue(s.read_until("STATUSLINE:", timeout=15), s.buf)
-        s.drain(0.5)
+        self.assertTrue(s.read_until("USER-STATUS window=200000", timeout=5), s.buf)
         sc = Screen(40, 120)
         sc.feed(s.buf)
         self.assertIn("USER-STATUS window=200000", sc.text())
@@ -1114,41 +1324,14 @@ class TestUniqueHandoffFile(PtyTestCase):
         self.log = os.path.join(self.cfg, "log")
 
     def env(self, **over):
-        e = {
-            "CLAUDE_CONFIG_DIR": self.cfg,
-            "CR_LOG": self.log,
-            "CR_SCRAPE": "never",
-            "CR_CONTEXT_TOKENS": "510000",
-            "CR_HANDOFF_FILE": "handoff.md",
-            "CR_ROOT_IDLE_SEC": "1",
-            "CR_HANDOFF_TIMEOUT_SEC": "45",
-            "CR_STEP_GAP_SEC": "0.5",
-            "CR_VERIFY_SEC": "8",
-            "CR_USER_IDLE_SEC": "0",
-            "CR_POLL_SEC": "0.3",
-            "CR_SLASH_GAP_SEC": "0.2",
-            "CR_SLASH_ENTER_GAP_SEC": "0.2",
-            "FAKE_USAGE": "700000",
-            "FAKE_USAGE_DELAY": "1.0",
-            "FAKE_MODEL": "claude-opus-5",
-        }
+        e = restart_timers(
+            CLAUDE_CONFIG_DIR=self.cfg,
+            CR_LOG=self.log,
+            CR_CONTEXT_TOKENS="510000",
+            FAKE_USAGE="700000",
+            FAKE_MODEL="claude-opus-5")
         e.update(over)
         return e
-
-    def logged(self):
-        try:
-            with open(self.log) as fh:
-                return fh.read()
-        except OSError:
-            return ""
-
-    def wait_log(self, needle, session, timeout=25):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if needle in self.logged():
-                return True
-            session.drain(0.3)
-        return needle in self.logged()
 
     def test_the_id_placeholder_resolves_to_a_real_file_and_still_restarts(self):
         s = self.session(env=self.env(CR_HANDOFF_FILE="scratchpad/RESUME-{id}.md"),
@@ -1166,7 +1349,9 @@ class TestUniqueHandoffFile(PtyTestCase):
         self.assertTrue(self.wait_log(
             "CR_RESUME_MSG does not contain {file}; a per-session handoff "
             "path cannot be passed to it", s))
-        s.drain(1)
+        # It is said before claude is started, and startup is the only place
+        # it is said: with claude on screen, startup is behind us.
+        self.assertTrue(s.read_until("winsize"))
         self.assertEqual(
             self.logged().count("CR_RESUME_MSG does not contain {file}"), 1)
 

@@ -113,7 +113,10 @@ class TestDegradation(unittest.TestCase):
         self.log = os.path.join(self.dir, "log")
 
     def env(self, **over):
-        e = {"CR_CLAUDE_BIN": self.claude, "CR_LOG": self.log}
+        # No update check: the tests below that do start a supervisor would
+        # otherwise be reading the developer's own ~/.agent-retrier/update.json
+        # — and, on the first run of the day, asking api.github.com.
+        e = {"CR_CLAUDE_BIN": self.claude, "CR_LOG": self.log, "CR_UPDATE_CHECK": "0"}
         e.update(over)
         return e
 
@@ -234,12 +237,22 @@ class TestHowTheSupervisorIsHandedOver(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.claude = launcher(self.dir)
         self.log = os.path.join(self.dir, "log")
+        self.tmp = os.path.join(self.dir, "tmp")
+        os.mkdir(self.tmp)
 
     def supervised(self, via):
         # "quit" rather than a closed stdin: the supervised claude sits on a pty
         # of its own, which does not end just because ours did.
+        #
+        # A TMPDIR of its own, because the last test here counts what the
+        # wrapper leaves in it. Counted in the machine's, that was a count of
+        # every wrapper on the machine: the statusline proxy drops (and
+        # removes) a file of the same name on every refresh of every live
+        # session, the other tests in this file do it too, and `./test/run.sh`
+        # now runs them at the same moment.
         env = {**clean_env(), "CR_CLAUDE_BIN": self.claude, "CR_LOG": self.log,
-               "CR_PY_VIA": via, "CR_UPDATE_CHECK": "0", "CR_NOTIFY": "0"}
+               "CR_PY_VIA": via, "CR_UPDATE_CHECK": "0", "CR_NOTIFY": "0",
+               "TMPDIR": self.tmp}
         r = subprocess.run([WRAP], env=env, input="quit\n",
                            capture_output=True, text=True, timeout=25)
         started = os.path.exists(self.log) and "start:" in open(self.log).read()
@@ -256,10 +269,9 @@ class TestHowTheSupervisorIsHandedOver(unittest.TestCase):
         self.assertTrue(started, r.stderr)
 
     def test_the_temp_file_does_not_outlive_the_exec(self):
-        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "agent-retrier.*")))
-        self.supervised("tmp")
-        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "agent-retrier.*")))
-        self.assertEqual(after - before, set())
+        r, started = self.supervised("tmp")
+        self.assertTrue(started, r.stderr)      # ...so there was a file to outlive it
+        self.assertEqual(glob.glob(os.path.join(self.tmp, "agent-retrier.*")), [])
 
 
 class TestPatternRobustness(unittest.TestCase):

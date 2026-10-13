@@ -14,11 +14,31 @@ import helper
 
 
 def _read_sessions(sessions_dir):
+    """pid -> record. Safe to call while the fakes are still writing: they
+    write `<pid>.json.tmp` and rename it, so a name that is not `<pid>.json`
+    yet, or a file gone by the time it is opened, is simply not an entry."""
     entries = {}
-    for name in os.listdir(sessions_dir):
-        with open(os.path.join(sessions_dir, name)) as fh:
-            entries[int(name[:-5])] = json.load(fh)
+    try:
+        names = os.listdir(sessions_dir)
+    except OSError:
+        return entries
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(sessions_dir, name)) as fh:
+                entries[int(name[:-5])] = json.load(fh)
+        except (OSError, ValueError):
+            continue
     return entries
+
+
+def _gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
 
 
 class TwoWrappersTestCase(unittest.TestCase):
@@ -28,6 +48,12 @@ class TwoWrappersTestCase(unittest.TestCase):
         self.addCleanup(a.close)
         self.addCleanup(b.close)
         return a, b
+
+    def one(self, cfg=None):
+        d = tempfile.mkdtemp(prefix="cr-two-test-")
+        a = helper.one_wrapper(d, cfg or {"agent": "claude"})
+        self.addCleanup(a.close)
+        return a
 
 
 class TestTwoWrappers(TwoWrappersTestCase):
@@ -51,12 +77,13 @@ class TestTwoWrappers(TwoWrappersTestCase):
         a, b = self.two()
         self.assertTrue(a.read_until("ready"))
         self.assertTrue(b.read_until("ready"))
-        time.sleep(0.3)  # both fakes have written sessions/<pid>.json by now
         a_pid, b_pid = a.agent_pid(), b.agent_pid()
         self.assertIsNotNone(a_pid)
         self.assertIsNotNone(b_pid)
         self.assertNotEqual(a_pid, b_pid)
         sessions_dir = os.path.join(os.path.dirname(a.log), "claude-config", "sessions")
+        # "ready" is printed a moment before sessions/<pid>.json is written.
+        helper.eventually(lambda: {a_pid, b_pid} <= set(_read_sessions(sessions_dir)))
         entries = _read_sessions(sessions_dir)
         self.assertIn(a_pid, entries)
         self.assertIn(b_pid, entries)
@@ -96,7 +123,9 @@ class TestTwoWrappers(TwoWrappersTestCase):
         wrapper_pid, agent_pid = a.pid, a.agent_pid()
         self.assertIsNotNone(agent_pid)
         a.close()
-        time.sleep(0.2)
+        # The wrapper was ours to reap and close() has; the agent was the
+        # wrapper's, so it is init that reaps it, in its own time.
+        helper.eventually(lambda: _gone(wrapper_pid) and _gone(agent_pid))
         with self.assertRaises(ProcessLookupError):
             os.kill(wrapper_pid, 0)
         with self.assertRaises(ProcessLookupError):
@@ -111,9 +140,20 @@ class TestTwoWrappers(TwoWrappersTestCase):
                         {"agent": "claude"})
         self.assertTrue(a.read_until("ready"))
         self.assertTrue(b.read_until("ready"))
-        time.sleep(0.6)
         a_pid, b_pid = a.agent_pid(), b.agent_pid()
-        sessions_dir = os.path.join(os.path.dirname(a.log), "claude-config", "sessions")
+        cfg_dir = os.path.join(os.path.dirname(a.log), "claude-config")
+        sessions_dir = os.path.join(cfg_dir, "sessions")
+
+        def grown():
+            # Only a writes a transcript at all; three rows in is "kept growing".
+            for root, _dirs, files in os.walk(os.path.join(cfg_dir, "projects")):
+                for f in files:
+                    if f.endswith(".jsonl"):
+                        with open(os.path.join(root, f)) as fh:
+                            return len(fh.readlines()) >= 3
+            return False
+
+        self.assertTrue(helper.eventually(grown))
         entries = _read_sessions(sessions_dir)
         self.assertEqual(entries[a_pid]["cwd"], entries[b_pid]["cwd"])
         self.assertNotEqual(entries[a_pid]["sessionId"], entries[b_pid]["sessionId"])
@@ -132,35 +172,39 @@ class TestTwoWrappers(TwoWrappersTestCase):
         self.assertTrue(a.read_until("usage limit detected", timeout=15))
         b.send("answer\r")
         self.assertTrue(b.read_until("GOT:answer", timeout=15))
-        self.assertFalse(a.read_until("wait cancelled", timeout=2))
+        # b's answer is in b's transcript (the fake writes the row before it
+        # says GOT), and a reads every file in the project. One poll interval
+        # so that a's next turn of the loop has to poll, then a line a can only
+        # answer by taking that turn: whatever a made of b's row, it has made
+        # it and said so. The line itself is a prompt, not an answer, and a
+        # prompt ends no wait.
+        time.sleep(0.2)                     # CR_POLL_SEC, as `base` sets it
+        self.assertTrue(a.roundtrip(), a.buf[-500:])
+        self.assertNotIn("wait cancelled", a.buf)
         self.assertNotIn("session is answering again", "".join(a.log_lines()))
+        # ...and it is still the wait it was. (Not "limit detected
+        # (transcript)": started in the same instant as a neighbour, a wrapper
+        # whose own sessions/<pid>.json is a poll late can be bound to the
+        # neighbour's for that one poll, and reads its own limit as theirs.)
+        self.assertIn("limit detected (", "".join(a.log_lines()))
 
     def test_only_the_session_above_the_threshold_is_folded(self):
         # The bug T02 removes: without registry-based identity, a's watcher
         # could pick up b's growth and read b's numbers as its own (or vice
         # versa), folding the wrong session or both.
-        base = {
-            "agent": "claude",
-            "CR_SCRAPE": "never",
-            "CR_CONTEXT_TOKENS": "510000",
-            "CR_HANDOFF_FILE": "handoff.md",
-            "CR_ROOT_IDLE_SEC": "1",
-            "CR_HANDOFF_TIMEOUT_SEC": "45",
-            "CR_STEP_GAP_SEC": "0.5",
-            "CR_VERIFY_SEC": "8",
-            "CR_USER_IDLE_SEC": "0",
-            "CR_POLL_SEC": "0.2",
-            "CR_SLASH_GAP_SEC": "0.2",
-            "CR_SLASH_ENTER_GAP_SEC": "0.2",
-            "FAKE_MODEL": "claude-opus-5",
-            "FAKE_USAGE_DELAY": "0.3",
-        }
+        base = helper.restart_timers(agent="claude", CR_CONTEXT_TOKENS="510000",
+                                     FAKE_MODEL="claude-opus-5")
         a, b = self.two(dict(base, FAKE_USAGE="700000"), dict(base, FAKE_USAGE="50000"))
         self.assertTrue(a.read_until("ready"))
         self.assertTrue(b.read_until("ready"))
         self.assertTrue(a.read_until("GOT:handoff", timeout=20), a.buf[-500:])
-        # b gets every chance it would need to (wrongly) fold too.
-        self.assertFalse(b.read_until("GOT:handoff", timeout=3))
+        # b gets every chance it would need to (wrongly) fold too. Started
+        # together and on the same clocks, a b that had taken a's count for
+        # its own would have decided to fold when a did — and a's phrase has
+        # since taken 0.6s to be typed and answered. What is left to wait out
+        # is how far apart two loops can reach the same decision (a poll and a
+        # turn, 0.35s), several times.
+        self.assertFalse(b.read_until("GOT:handoff", timeout=1.5))
         self.assertIn("folding up", "".join(a.log_lines()))
         self.assertNotIn("folding up", "".join(b.log_lines()))
 
@@ -181,26 +225,14 @@ class TestTwoWrappers(TwoWrappersTestCase):
         shared = tempfile.mkdtemp(prefix="cr-two-handoff-cfg-")
         self.addCleanup(shutil.rmtree, shared, ignore_errors=True)
         log = os.path.join(shared, "shared.log")
-        base = {
-            "CLAUDE_CONFIG_DIR": os.path.join(shared, "claude-config"),
-            "CODEX_HOME": os.path.join(shared, "codex-home"),
-            "agent": "claude",
-            "CR_SCRAPE": "never",
-            "CR_CONTEXT_TOKENS": "510000",
-            "CR_HANDOFF_FILE": "handoff.md",
-            "CR_HANDOFF_REGISTRY_DIR": os.path.join(shared, "handoff-registry"),
-            "CR_ROOT_IDLE_SEC": "1",
-            "CR_HANDOFF_TIMEOUT_SEC": "45",
-            "CR_STEP_GAP_SEC": "0.5",
-            "CR_VERIFY_SEC": "8",
-            "CR_USER_IDLE_SEC": "0",
-            "CR_POLL_SEC": "0.2",
-            "CR_SLASH_GAP_SEC": "0.2",
-            "CR_SLASH_ENTER_GAP_SEC": "0.2",
-            "FAKE_MODEL": "claude-opus-5",
-            "FAKE_USAGE": "700000",
-            "FAKE_USAGE_DELAY": "0.3",
-        }
+        base = helper.restart_timers(
+            CLAUDE_CONFIG_DIR=os.path.join(shared, "claude-config"),
+            CODEX_HOME=os.path.join(shared, "codex-home"),
+            agent="claude",
+            CR_CONTEXT_TOKENS="510000",
+            CR_HANDOFF_REGISTRY_DIR=os.path.join(shared, "handoff-registry"),
+            FAKE_MODEL="claude-opus-5",
+            FAKE_USAGE="700000")
         a = helper.WrapperSession(cwd=d, log=log, env=dict(base))
         self.addCleanup(a.close)
         self.assertTrue(a.read_until("ready"))

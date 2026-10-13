@@ -3,11 +3,13 @@
 Both the code and the pattern arrays come from the shell script itself, so a test
 can never pass against a copy that has drifted from what actually ships.
 """
+import atexit
 import fcntl
 import importlib.util
 import os
 import pty
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -52,6 +54,14 @@ def load(**overrides):
     for k, v in overrides.items():
         os.environ[k] = str(v)
     os.environ.setdefault("CR_LOG", os.path.join(tempfile.gettempdir(), "agent-retrier-test.log"))
+    # And likewise everything else the implementation keeps under
+    # ~/.agent-retrier. A controller built in a unit test is still a
+    # controller: one that folds a codex session writes down what the fold
+    # cost, and with nothing set that went into the developer's own
+    # folds.json — a "fold" of 1000 tokens, dated 1970, for every run of the
+    # suite — next to the real ones CR_CODEX_RESERVE_ADAPT learns from.
+    for k, v in state_paths(_own_state()).items():
+        os.environ.setdefault(k, v)
 
     src = _dump("--cr-dump-python")
     path = os.path.join(tempfile.mkdtemp(prefix="cr-"), "cr_impl.py")
@@ -62,6 +72,162 @@ def load(**overrides):
     sys.modules["cr_impl"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+_STATE = []
+
+
+def _own_state():
+    """This process's stand-in for ~/.agent-retrier, for the implementation as
+    `load()` imports it. Made once, gone when the process is."""
+    if not _STATE:
+        _STATE.append(tempfile.mkdtemp(prefix="cr-state-"))
+        atexit.register(shutil.rmtree, _STATE[0], ignore_errors=True)
+    return _STATE[0]
+
+
+def state_paths(state):
+    """Every file the wrapper keeps between one run and the next, by the
+    setting that says where — all of them moved into `state`."""
+    return {
+        "CR_UPDATE_CACHE": os.path.join(state, "update.json"),
+        "CR_MODEL_CACHE": os.path.join(state, "windows.json"),
+        "CR_HANDOFF_REGISTRY_DIR": os.path.join(state, "sessions"),
+        "CR_STATUS_DIR": os.path.join(state, "status"),
+        "CR_CODEX_FOLDS_FILE": os.path.join(state, "folds.json"),
+    }
+
+
+def hermetic_env(state):
+    """What a wrapper under test is started with so that it keeps to itself:
+    everything it would otherwise read from, or leave behind in, the developer's
+    own `~/.agent-retrier` is pointed into `state` instead.
+
+    Left at their defaults these made every run a guest in somebody's real home.
+    `sessions/` is where the LIVE wrappers on the machine claim their handoff
+    paths, and a test wrapper both read those claims and pruned among them.
+    `folds.json` is the history CR_CODEX_RESERVE_ADAPT learns from, and every
+    codex fold in the suite was appended to it as though it had happened.
+    `update.json` decides whether a launch stops for CR_UPDATE_NOTICE_SEC to say
+    a newer release is out — two seconds on every session, on any machine whose
+    checkout is behind — and a stale one sends the first session of the day to
+    api.github.com. None of that is the suite's to read or to write — and two
+    test processes side by side, which is what `./test/run.sh` now runs, would
+    be doing it to each other as well.
+
+    So: no update check and no model lookup (the only two things here that ask
+    the network anything), and a directory of its own for the rest. The tests
+    that are ABOUT the update notice, or the registry, switch them back on and
+    name their own files, exactly as before; this is only the default.
+
+    `CR_PYTHON` is the interpreter the suite itself runs under. `python3` on a
+    developer's PATH is as often as not a pyenv/asdf shim, and `cr_find_python`
+    has to go through it to learn which interpreter it really is — a tenth of
+    a second a launch here, a few hundred launches a run, to arrive at the
+    answer `sys.executable` already is. The resolution itself still runs, on
+    the candidate it is handed; test_degrade.py is where the default candidates
+    are exercised, and it does not come through here.
+    """
+    env = state_paths(state)
+    env.update({"CR_UPDATE_CHECK": "0", "CR_MODEL_LOOKUP": "0"})
+    if sys.executable:
+        env["CR_PYTHON"] = sys.executable
+    return env
+
+
+# From the fake's last startup row to the fold, in a session that is going to
+# be folded: the transcript quiet for CR_ROOT_IDLE_SEC, one poll to notice it,
+# one turn of the supervisor's loop (0.25s) to act on it, and 0.6s for the
+# phrase to be typed and answered — a second and a half. LEFT_ALONE is twice
+# that, because the tests that wait this long are the ones asserting that
+# NOTHING happened, and a window that is too short does not fail: it just
+# stops proving anything.
+ROOT_IDLE = 0.5
+LEFT_ALONE = 3.0
+
+
+def restart_timers(**over):
+    """The clocks every context-restart test runs on, in the one place they are
+    set. They were five copies of the same dict, and the copies had drifted.
+
+    Each is as short as it can be while still meaning what it means:
+
+      FAKE_USAGE_DELAY   the fake writes its usage row twice, this far apart,
+                         because the first can land before the wrapper has
+                         seeded its watcher and be invisible (see fake_claude).
+                         Shorter than CR_ROOT_IDLE_SEC, so the fold is decided
+                         on a transcript that has gone quiet after BOTH.
+      CR_ROOT_IDLE_SEC   how long a transcript has to say nothing before the
+                         turn is taken to be over. The line above is its only
+                         floor here.
+      CR_VERIFY_SEC      how long a typed phrase may go unanswered before it is
+                         typed again. NOT shortened: nothing on the ordinary
+                         path waits for it, and a `/clear` retyped because a
+                         loaded runner was a few seconds late is a second
+                         `/clear`. The two tests that do sit this out say so
+                         and set their own.
+      CR_STEP_GAP_SEC,   pauses for a TUI to settle. The fake is line-oriented
+      CR_SLASH_*         and needs none; they only have to stay in order.
+
+    What is NOT here is the one wait these tests cannot shorten: a step held
+    back by a session that is still writing is looked at again GATE_RETRY (5s)
+    later, and every fold is followed by exactly one such hold before `/clear`
+    — the handoff is accepted on the very row that makes the session look busy.
+    """
+    e = {
+        "CR_SCRAPE": "never",
+        "CR_HANDOFF_FILE": "handoff.md",
+        "CR_HANDOFF_TIMEOUT_SEC": "45",
+        "CR_USER_IDLE_SEC": "0",
+        "CR_ROOT_IDLE_SEC": str(ROOT_IDLE),
+        "CR_POLL_SEC": "0.1",
+        "CR_VERIFY_SEC": "8",
+        "CR_STEP_GAP_SEC": "0.2",
+        "CR_SLASH_GAP_SEC": "0.1",
+        "CR_SLASH_ENTER_GAP_SEC": "0.1",
+        "FAKE_USAGE_DELAY": "0.3",
+    }
+    e.update(over)
+    return e
+
+
+def eventually(probe, timeout=5.0, every=0.02):
+    """Call `probe` until it answers with something true, and return that.
+
+    For the things a test used to give "long enough" with a `time.sleep`: a row
+    the fake is about to write, a pid file, a process on its way out. Sleeping
+    for them is slow when the machine is idle and wrong when it is not.
+    """
+    deadline = time.time() + timeout
+    while True:
+        got = probe()
+        if got or time.time() >= deadline:
+            return got
+        time.sleep(every)
+
+
+def roundtrip(session, word="tick", timeout=10):
+    """Type a line and wait for the fake to answer it — proof the wrapper has
+    been all the way round its loop since the line was sent.
+
+    This is what a test stands on to say something did NOT happen. The
+    supervisor is one thread: the turn of the loop that reads our line off its
+    stdin is the same turn that confirms a scraped banner, polls the
+    transcript, ticks the controller and paints the badge, and it logs what it
+    decides before it reads another byte. So an answer to a line sent after a
+    deadline means whatever was due by that deadline has been decided and
+    written down, however slow the machine is — which a sleep of any length
+    only makes likely. And the fake answers lines in the order they were
+    typed, so anything the wrapper typed ahead of ours has been answered too.
+
+    It is typing, and the wrapper sees it as typing; the fake records it in
+    its transcript like any other prompt. Not for a test whose point is that
+    nobody touched the session.
+    """
+    session.trips = getattr(session, "trips", 0) + 1
+    line = "%s-%d" % (word, session.trips)
+    session.send(line + "\r")
+    return session.read_until("GOT:" + line, timeout=timeout)
 
 
 def _fake_bin(agent):
@@ -130,6 +296,10 @@ class WrapperSession:
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
         full = {k: v for k, v in os.environ.items()
                 if not k.startswith("CR_") and k not in ("AGENT_RETRIER_ACTIVE",)}
+        # Next to the log, because the log is the one thing a pair is already
+        # required to share: two wrappers over one project dir have to see each
+        # other's handoff claims (T05) the way two real ones in one home would.
+        full.update(hermetic_env(os.path.dirname(log)))
         full.update({
             "CR_CLAUDE_BIN": _fake_bin(agent),
             "CR_LOG": log,
@@ -176,6 +346,9 @@ class WrapperSession:
 
     def send(self, text):
         os.write(self.master, text.encode())
+
+    def roundtrip(self, word="tick", timeout=10):
+        return roundtrip(self, word, timeout)
 
     def wait(self, timeout=10):
         deadline = time.time() + timeout
@@ -241,12 +414,7 @@ def two_wrappers(project_dir, cfg_a, cfg_b):
     leave a supervisor running.
     """
     os.makedirs(project_dir, exist_ok=True)
-    shared_dir = tempfile.mkdtemp(prefix="cr-two-")
-    log = os.path.join(shared_dir, "shared.log")
-    base = {
-        "CLAUDE_CONFIG_DIR": os.path.join(shared_dir, "claude-config"),
-        "CODEX_HOME": os.path.join(shared_dir, "codex-home"),
-    }
+    log, base = _shared_home()
     a_env = dict(base)
     a_env.update(cfg_a or {})
     b_env = dict(base)
@@ -254,3 +422,28 @@ def two_wrappers(project_dir, cfg_a, cfg_b):
     a = WrapperSession(cwd=project_dir, log=log, env=a_env)
     b = WrapperSession(cwd=project_dir, log=log, env=b_env)
     return a, b
+
+
+def _shared_home():
+    """`(log, env)`: one fresh directory holding the `CR_LOG` and the agents'
+    own config dirs, which is what makes two wrappers started from it a pair."""
+    shared_dir = tempfile.mkdtemp(prefix="cr-two-")
+    return os.path.join(shared_dir, "shared.log"), {
+        "CLAUDE_CONFIG_DIR": os.path.join(shared_dir, "claude-config"),
+        "CODEX_HOME": os.path.join(shared_dir, "codex-home"),
+    }
+
+
+def one_wrapper(project_dir, cfg):
+    """One wrapper, laid out exactly as `two_wrappers()` lays out each of a
+    pair — `claude-config` and `codex-home` next to the log — for the tests
+    that are about what a single fake does and have no use for a neighbour.
+
+    test_fake_agents.py used to start the pair anyway and throw one away: a
+    second supervisor, a second fake and a second teardown per test, to prove
+    nothing about either.
+    """
+    os.makedirs(project_dir, exist_ok=True)
+    log, env = _shared_home()
+    env.update(cfg or {})
+    return WrapperSession(cwd=project_dir, log=log, env=env)
