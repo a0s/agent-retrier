@@ -647,24 +647,34 @@ cr_is_bare_word() {
 # have — so every probe runs detached from stdin and on a leash.
 : "${CR_PROBE_TIMEOUT_SEC:=5}"
 
+# The answer is collected in a file rather than a pipe so that a shell we had to
+# kill, with something of its own still holding the pipe open, cannot keep us
+# reading for ever. The file is opened twice — once to write, once to read —
+# and unlinked before the probe is even started: from then on it has no name,
+# and there is nothing for a wrapper that is itself killed halfway through the
+# wait (^C at a slow rc file is the obvious one) to leave behind in $TMPDIR.
+# Named, for the instant it has a name, like every other file of ours — a bare
+# `mktemp` on macOS does not even look at $TMPDIR.
 cr_probe() {
-  local tmp rc pid waited=0 limit=$((CR_PROBE_TIMEOUT_SEC * 10))
-  tmp=$(mktemp 2>/dev/null) || return 1
-  "$@" >"$tmp" 2>/dev/null </dev/null &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ "$waited" -ge "$limit" ]; then
-      kill -9 "$pid" 2>/dev/null
-      wait "$pid" 2>/dev/null
-      rm -f "$tmp"
-      return 124
-    fi
-    sleep 0.1
-    waited=$((waited + 1))
-  done
-  wait "$pid"; rc=$?
-  cat "$tmp"
-  rm -f "$tmp"
+  local tmp pid rc=1 waited=0 limit=$((CR_PROBE_TIMEOUT_SEC * 10))
+  tmp=$(mktemp "${TMPDIR:-/tmp}/agent-retrier.XXXXXX" 2>/dev/null) || return 1
+  {
+    rm -f "$tmp"
+    "$@" >&8 2>/dev/null </dev/null 8>&- 9<&- &
+    pid=$!
+    rc=0
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ "$waited" -ge "$limit" ]; then
+        kill -9 "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        rc=124
+        break
+      fi
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    [ "$rc" -eq 124 ] || { wait "$pid"; rc=$?; cat <&9; }
+  } 8>"$tmp" 9<"$tmp"
   return "$rc"
 }
 
@@ -837,6 +847,7 @@ import re
 import select
 import shlex
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -997,6 +1008,8 @@ CFG = dict(
     # -- claude's own statusline, relayed by --cr-statusline (T20) --
     statusline_proxy=_env("CR_STATUSLINE_PROXY", "1") == "1",
     status_dir=_env("CR_STATUS_DIR", os.path.expanduser("~/.agent-retrier/status")),
+    # -- the copies of this program older versions left in $TMPDIR --
+    tmp_sweep=_env("CR_TMP_SWEEP", "1") == "1",
 )
 
 
@@ -6598,10 +6611,19 @@ def run_statusline_proxy(status_path, stdin=None, stdout=None):
     return result.returncode
 
 
-def main(argv):
-    # Started from a temp file because /dev/fd was not available: it has done its
-    # job the moment python has read it, and leaving it behind would litter /tmp
-    # with copies of the wrapper.
+# --------------------------------------------------------------------------- #
+# our own copies in $TMPDIR: the one we were started from, and the old ones
+# --------------------------------------------------------------------------- #
+def drop_own_tmp():
+    """Started from a temp file because /dev/fd was not available: it has done
+    its job the moment python has read it, and leaving it behind would litter
+    /tmp with copies of the wrapper.
+
+    The first thing this program does, whichever mode it was started in. It
+    used to be the first thing `main` did, which is the session only: the
+    statusline proxy and `--cr-models` left theirs to the shell that started
+    them, and a shell that is killed while it waits removes nothing.
+    """
     tmp = os.environ.pop("CR_PY_TMP", "")
     if tmp:
         try:
@@ -6609,6 +6631,64 @@ def main(argv):
         except OSError:
             pass
 
+
+# What `mktemp agent-retrier.XXXXXX` makes, and how every copy of this file
+# begins — the first line of the docstring at the very top.
+_OWN_TMP_NAME = re.compile(r"agent-retrier\.[A-Za-z0-9]{6}\Z")
+_OWN_TMP_HEAD = b'"""agent-retrier PTY supervisor.'
+OWN_TMP_STALE_SEC = 24 * 3600
+
+
+def sweep_stale_tmp(tmpdir=None, now=None):
+    """Remove what 3.0.3 and earlier left in $TMPDIR, and say how much it was.
+
+    Every refresh of claude's statusline that was cut short left a copy of
+    this program there (see `cr_python` in the shell half): 300 KB each, a
+    hundred or two a day, and the oldest were all still there nine days on.
+    Nothing makes them any more, but the ones already made are ours to pick
+    up — nobody else knows what they are.
+
+    Deleting from a shared directory by pattern is how a tidy-up eats
+    somebody's work, so a file has to be ours five times over before it goes:
+    the name `mktemp` gave it, a plain file and not a link to one, owned by
+    this user, untouched for a day, and either empty or beginning the way this
+    program begins (a copy that was cut off while it was being written is a
+    prefix of one, and an empty one was cut off before the first byte).
+
+    None of them can be in use. Such a file is read exactly once, by the
+    python that was started on it, in full and before its first line runs —
+    a matter of milliseconds, not of a day. A wrapper of an older version
+    running beside this one still makes them; a day is as safe for those.
+    """
+    tmpdir = tmpdir or os.environ.get("TMPDIR") or "/tmp"
+    now = time.time() if now is None else now
+    count = freed = 0
+    try:
+        names = os.listdir(tmpdir)
+    except OSError:
+        return 0, 0
+    for name in names:
+        if not _OWN_TMP_NAME.match(name):
+            continue
+        path = os.path.join(tmpdir, name)
+        try:
+            st = os.lstat(path)
+            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
+                    or now - st.st_mtime < OWN_TMP_STALE_SEC):
+                continue
+            if st.st_size:
+                with open(path, "rb") as fh:
+                    if fh.read(len(_OWN_TMP_HEAD)) != _OWN_TMP_HEAD:
+                        continue
+            os.unlink(path)
+        except OSError:
+            continue
+        count += 1
+        freed += st.st_size
+    return count, freed
+
+
+def main(argv):
     launch = launch_vector()
     claude = launch[0]
     agent_name = pick_agent(CFG["agent"], launch)
@@ -6617,6 +6697,16 @@ def main(argv):
     session_start = time.time()
     log("start: %s %s (agent: %s) cwd=%s"
         % (" ".join(launch), " ".join(argv), agent_name, os.getcwd()))
+
+    # Once a session, and here rather than in the statusline proxy that made
+    # them: that one runs on every refresh and has to answer before the next.
+    if CFG["tmp_sweep"]:
+        swept, freed = sweep_stale_tmp()
+        if swept:
+            log("removed %d stale %s of this program (%.1f MB) that 3.0.3 and "
+                "earlier left in %s (CR_TMP_SWEEP=0 to disable)"
+                % (swept, "copy" if swept == 1 else "copies", freed / 1e6,
+                   os.environ.get("TMPDIR") or "/tmp"))
 
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
@@ -7162,6 +7252,7 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    drop_own_tmp()
     if sys.argv[1:2] == ["--cr-models"]:
         # A pure lookup, not a session: no pty, no fork, nothing to supervise.
         sys.exit(print_models_table())
@@ -7187,6 +7278,73 @@ CR_PAT_AGENTS_PANEL_ROW=$(printf '%s\n' "${CR_AGENTS_PANEL_ROW_PATTERNS[@]}")
 export CR_PAT_LIMIT CR_PAT_RESET CR_PAT_WORKING CR_PAT_MENU CR_PAT_IGNORE CR_PAT_ROSTER
 export CR_PAT_STALL CR_PAT_AGENT_ROW CR_PAT_AGENTS_PANEL_ROW
 
+# How the python above reaches the interpreter — for a session, and for the two
+# one-shot modes below, which is where this used to go wrong.
+#
+# It is handed over on a file descriptor rather than as an argument. Linux caps
+# a SINGLE argument at 128 KiB (MAX_ARG_STRLEN, and no ulimit raises it) while
+# macOS only caps the whole vector, so `-c "$CR_PY"` worked on one platform and
+# stopped working on the other the moment this file grew past that — "Argument
+# list too long", and every wrapped session degrading to nothing.
+#
+# /dev/fd/3 is read by python exactly like a script file, and the code never
+# touches the disk. That last part is the point. `--cr-statusline` and
+# `--cr-models` used to write a temp file, run python on it and `rm` it
+# afterwards — and "afterwards" does not come for a shell that was killed while
+# it waited. Claude Code starts the statusline command as the leader of its own
+# process group, and when the next refresh is due before this one has answered
+# it sends that whole group SIGTERM (SIGKILL a second and a half later, to
+# whatever is left). bash died where it stood, the `rm` with it, and 300 KB
+# stayed in $TMPDIR: 1600 of them on one machine in nine days, half a gigabyte.
+# A file that was never made needs nobody to live long enough to remove it —
+# which is the only arrangement SIGKILL cannot get around.
+#
+# Where /dev/fd is not mounted (a bare chroot) a temp file is the fallback, and
+# there it is guarded from both ends. Until python is up, the traps here are
+# what remove it, however this shell is told to stop; python then unlinks it as
+# its own first act, so from that moment it belongs to nobody, and not even a
+# SIGKILL leaves it behind. A session is exec'd — python has to BE the pid the
+# terminal and the caller signal — so its file is covered by the traps only
+# while it is being written, and by that unlink from then on. A one-shot mode
+# has no such duty, so the shell stays, traps and all, until python is done:
+# killed as a group, python goes and the trap runs; killed alone, the trap waits
+# for python and runs then. What is left is a SIGKILL in the tenth of a second
+# python takes to get as far as its first line. No trap is run for that one.
+# auto | fd | tmp — the tests drive both routes; nobody else needs to.
+: "${CR_PY_VIA:=auto}"
+CR_PY_TMP=""
+
+cr_python() {   # $1 = session | oneshot, the rest is what python is started with
+  local how="$1"
+  shift
+  if [ "$CR_PY_VIA" != "tmp" ] && [ -d /dev/fd ]; then
+    exec "$CR_PYTHON_BIN" /dev/fd/3 "$@" 3< <(printf '%s' "$CR_PY")
+  fi
+  # The traps before the file: a signal that lands between the two finds nothing
+  # to remove, where the other order would find a file and no trap. EXIT does
+  # the removing; the signals only have to turn a death into an exit, with the
+  # status a shell would have reported for it anyway.
+  trap '[ -z "$CR_PY_TMP" ] || rm -f "$CR_PY_TMP"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 141' PIPE
+  trap 'exit 143' TERM
+  CR_PY_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-retrier.XXXXXX") || {
+    CR_PY_TMP=""
+    trap - EXIT HUP INT QUIT PIPE TERM
+    return 1
+  }
+  printf '%s' "$CR_PY" >"$CR_PY_TMP"
+  export CR_PY_TMP
+  # A successful exec runs no EXIT trap and puts every trapped signal back to
+  # its default, so python starts with the file still there and nothing odd in
+  # its signal table.
+  [ "$how" != "session" ] || exec "$CR_PYTHON_BIN" "$CR_PY_TMP" "$@"
+  "$CR_PYTHON_BIN" "$CR_PY_TMP" "$@"
+  exit $?
+}
+
 case "${1:-}" in
   --cr-dump-python)
     printf '%s\n' "$CR_PY"
@@ -7206,15 +7364,9 @@ case "${1:-}" in
       echo "agent-retrier: no usable python3 found" >&2
       exit 1
     }
-    CR_MODELS_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-retrier.XXXXXX") || {
-      echo "agent-retrier: cannot write a temporary file" >&2
-      exit 1
-    }
-    printf '%s' "$CR_PY" >"$CR_MODELS_TMP"
-    "$CR_PYTHON_BIN" "$CR_MODELS_TMP" --cr-models
-    CR_MODELS_RC=$?
-    rm -f "$CR_MODELS_TMP"
-    exit "$CR_MODELS_RC" ;;
+    cr_python oneshot --cr-models
+    echo "agent-retrier: cannot write a temporary file" >&2
+    exit 1 ;;
   --cr-statusline)
     # Claude Code itself runs this, as the command `claude_launch_args` (T20)
     # put in `--settings`: no claude/codex needs to be installed for it, and
@@ -7225,15 +7377,9 @@ case "${1:-}" in
       echo "agent-retrier: no usable python3 found" >&2
       exit 1
     }
-    CR_STATUSLINE_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-retrier.XXXXXX") || {
-      echo "agent-retrier: cannot write a temporary file" >&2
-      exit 1
-    }
-    printf '%s' "$CR_PY" >"$CR_STATUSLINE_TMP"
-    "$CR_PYTHON_BIN" "$CR_STATUSLINE_TMP" --cr-statusline "${2:-}"
-    CR_STATUSLINE_RC=$?
-    rm -f "$CR_STATUSLINE_TMP"
-    exit "$CR_STATUSLINE_RC" ;;
+    cr_python oneshot --cr-statusline "${2:-}"
+    echo "agent-retrier: cannot write a temporary file" >&2
+    exit 1 ;;
 esac
 
 # ---- degrade paths: any of these and we run claude untouched -----------------
@@ -7370,26 +7516,9 @@ export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
 export CR_CONTEXT_MIN_HEADROOM CR_CONTEXT_MAX_PER_HOUR CR_NOTIFY_REPEAT_SEC
 export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC
 
-# The supervisor is handed over on a file descriptor rather than as an argument.
-# Linux caps a SINGLE argument at 128 KiB (MAX_ARG_STRLEN, and no ulimit raises
-# it) while macOS only caps the whole vector, so `-c "$CR_PY"` worked on one
-# platform and stopped working on the other the moment this file grew past that
-# — "Argument list too long", and every wrapped session degrading to nothing.
-#
-# /dev/fd/3 is read by python exactly like a script file, and the code never
-# touches the disk. Where /dev/fd is not mounted (a bare chroot), a temp file is
-# the fallback; the supervisor unlinks it as its first act, so it lives for the
-# length of one exec and belongs to nobody afterwards.
-# auto | fd | tmp — the tests drive both routes; nobody else needs to.
-: "${CR_PY_VIA:=auto}"
-if [ "$CR_PY_VIA" != "tmp" ] && [ -d /dev/fd ]; then
-  exec "$CR_PYTHON_BIN" /dev/fd/3 "$@" 3< <(printf '%s' "$CR_PY")
-fi
-
-CR_PY_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-retrier.XXXXXX") || {
-  echo "agent-retrier: cannot write a temporary file; running claude unwrapped" >&2
-  exec "${CR_ARGV[@]}" "$@"
-}
-printf '%s' "$CR_PY" >"$CR_PY_TMP"
-export CR_PY_TMP
-exec "$CR_PYTHON_BIN" "$CR_PY_TMP" "$@"
+# From here on python is this process (see cr_python, above the --cr-* modes).
+# It returns only where there is no /dev/fd and no temp file could be made
+# either — and that, like every other doubt, means plain claude.
+cr_python session "$@"
+echo "agent-retrier: cannot write a temporary file; running claude unwrapped" >&2
+exec "${CR_ARGV[@]}" "$@"

@@ -170,6 +170,7 @@ class Session(object):
             "CR_NOTIFY": "0",
             "CR_AGENTS_OVERLAY": "0",
             "CR_UPDATE_CHECK": "0",
+            "CR_TMP_SWEEP": "0",        # the developer's $TMPDIR is not ours to tidy
             "CR_CONTEXT_RESTART": "0",  # no fold of its own mid-checklist
             "PYTHONUNBUFFERED": "1",
         })

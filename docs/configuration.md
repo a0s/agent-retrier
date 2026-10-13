@@ -295,6 +295,7 @@ these were written for; reach for them when something specific is wrong.
 | `CR_UPDATE_URL` | derived from `CR_UPDATE_REPO` | both | override the releases feed outright |
 | `CR_UPDATE_TIMEOUT_SEC` | `10` | both | request timeout for the update check |
 | `CR_WAIT_SCALE` | `1` | both | divide every wait by this; the test suite runs at `3600`, which is what it is for |
+| `CR_TMP_SWEEP` | `1` | both | `0` leaves `$TMPDIR` alone. Otherwise a session, as it starts, removes the `agent-retrier.XXXXXX` copies of the supervisor that 3.0.3 and earlier left there — its own by name, owner and content, and a day old at least |
 
 ## Detection patterns
 

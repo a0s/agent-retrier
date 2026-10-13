@@ -33,10 +33,16 @@ def clean_env():
     to the wrapper — degrade, do not stack a second supervisor. Every wrapper
     started here would obey it, and the tests would be measuring the caller's
     session instead of the code.
+
+    Plus the one switch nothing started from here should be without: a session
+    sweeps $TMPDIR for what older versions left in it, and the $TMPDIR these
+    wrappers inherit is the developer's own.
     """
-    return {k: v for k, v in os.environ.items()
-            if not k.startswith("CR_")
-            and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CR_")
+           and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+    env["CR_TMP_SWEEP"] = "0"
+    return env
 
 
 def run(args=(), env=None, stdin=subprocess.DEVNULL, timeout=30):
@@ -246,10 +252,10 @@ class TestHowTheSupervisorIsHandedOver(unittest.TestCase):
         #
         # A TMPDIR of its own, because the last test here counts what the
         # wrapper leaves in it. Counted in the machine's, that was a count of
-        # every wrapper on the machine: the statusline proxy drops (and
-        # removes) a file of the same name on every refresh of every live
-        # session, the other tests in this file do it too, and `./test/run.sh`
-        # now runs them at the same moment.
+        # every wrapper on the machine: an older one's statusline proxy drops
+        # a file of the same name on every refresh of every live session (and
+        # does not always remove it — test_tmp.py), and `./test/run.sh` runs
+        # this file's own tests at the same moment.
         env = {**clean_env(), "CR_CLAUDE_BIN": self.claude, "CR_LOG": self.log,
                "CR_PY_VIA": via, "CR_UPDATE_CHECK": "0", "CR_NOTIFY": "0",
                "TMPDIR": self.tmp}

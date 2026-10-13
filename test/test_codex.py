@@ -1396,7 +1396,7 @@ class TestCalledAsCodex(unittest.TestCase):
                and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
         env.update({"PATH": path or (self.codex_dir + ":/usr/bin:/bin"),
                     "SHELL": "/bin/sh", "CR_LOG": self.log, "CODEX_HOME": self.dir,
-                    "CR_NOTIFY": "0", "CR_UPDATE_CHECK": "0"})
+                    "CR_NOTIFY": "0", "CR_UPDATE_CHECK": "0", "CR_TMP_SWEEP": "0"})
         env.update(over)
         return subprocess.run([self.prog, *self.FLAGS, *args], env=env,
                               stdin=subprocess.DEVNULL,
@@ -1480,7 +1480,7 @@ class TestClaudeName(unittest.TestCase):
                and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
         env.update({"PATH": self.bin + ":/usr/bin:/bin", "SHELL": "/bin/sh",
                     "CR_LOG": os.path.join(self.dir, "log"), "CR_NOTIFY": "0",
-                    "CR_UPDATE_CHECK": "0"})
+                    "CR_UPDATE_CHECK": "0", "CR_TMP_SWEEP": "0"})
         return subprocess.run([prog, *args], env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=30)
 

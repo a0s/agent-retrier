@@ -86,6 +86,7 @@ def run(args, env, timeout=30):
     # very wrapper under test; start from a clean environment.
     full = {k: v for k, v in os.environ.items()
             if not k.startswith("CR_") and k != "AGENT_RETRIER_ACTIVE"}
+    full["CR_TMP_SWEEP"] = "0"       # the developer's $TMPDIR is not ours to tidy
     full.update(env)
     return subprocess.run([WRAP, *args], env=full, stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, timeout=timeout)

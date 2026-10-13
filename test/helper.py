@@ -120,6 +120,12 @@ def hermetic_env(state):
     that are ABOUT the update notice, or the registry, switch them back on and
     name their own files, exactly as before; this is only the default.
 
+    And no sweep of $TMPDIR. A session removes the stale copies of the
+    supervisor that older versions left there, and the $TMPDIR a test wrapper
+    inherits is the developer's: whether those go is theirs to decide, not
+    something the first test of a run does on the way past. The few places that
+    start a wrapper without coming through here set CR_TMP_SWEEP=0 themselves.
+
     `CR_PYTHON` is the interpreter the suite itself runs under. `python3` on a
     developer's PATH is as often as not a pyenv/asdf shim, and `cr_find_python`
     has to go through it to learn which interpreter it really is — a tenth of
@@ -129,7 +135,7 @@ def hermetic_env(state):
     are exercised, and it does not come through here.
     """
     env = state_paths(state)
-    env.update({"CR_UPDATE_CHECK": "0", "CR_MODEL_LOOKUP": "0"})
+    env.update({"CR_UPDATE_CHECK": "0", "CR_MODEL_LOOKUP": "0", "CR_TMP_SWEEP": "0"})
     if sys.executable:
         env["CR_PYTHON"] = sys.executable
     return env
