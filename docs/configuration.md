@@ -199,6 +199,7 @@ next to it. Set the shared one and both agents use it; set
 | `CR_HANDOFF_ATTEMPTS` | `2` | both | folds attempted before giving up |
 | `CR_ROOT_IDLE_SEC` | `20` | claude | transcript quiet this long means the turn is over (codex reads its rollout's own turn rows instead) |
 | `CR_HANDOFF_TIMEOUT_SEC` | `900` | both | per step, and frozen while a limit runs |
+| `CR_GATE_RETRY_SEC` | `5` | both | a step held back because you are typing or the session is still writing is looked at again this much later; zero, negative or unparseable means the default |
 | `CR_CLEAR_SETTLE_SEC` | `5` | both | screen quiet this long after `/clear` counts as confirmation on its own |
 | `CR_STEP_GAP_SEC` | `3` | both | between `/clear` and the resume phrase |
 | `CR_RESUME_ATTEMPTS` | `5` | both | unfold retries, each wait doubling, before the debt becomes visible instead of retried |

@@ -174,11 +174,15 @@ def restart_timers(**over):
                          and set their own.
       CR_STEP_GAP_SEC,   pauses for a TUI to settle. The fake is line-oriented
       CR_SLASH_*         and needs none; they only have to stay in order.
-
-    What is NOT here is the one wait these tests cannot shorten: a step held
-    back by a session that is still writing is looked at again GATE_RETRY (5s)
-    later, and every fold is followed by exactly one such hold before `/clear`
-    — the handoff is accepted on the very row that makes the session look busy.
+      CR_GATE_RETRY_SEC  how long a step held back by a session that is still
+                         writing waits before it is looked at again. Every fold
+                         is followed by at least one such hold before `/clear`
+                         — the handoff is accepted on the very row that makes
+                         the session look busy — and at the 5s default every
+                         test that reaches `/clear` sat it out in full. Shorter
+                         only means the gate is asked more often; what it
+                         answers is unchanged, so a test that proves a step is
+                         held proves it over more looks, not fewer.
     """
     e = {
         "CR_SCRAPE": "never",
@@ -191,6 +195,7 @@ def restart_timers(**over):
         "CR_STEP_GAP_SEC": "0.2",
         "CR_SLASH_GAP_SEC": "0.1",
         "CR_SLASH_ENTER_GAP_SEC": "0.1",
+        "CR_GATE_RETRY_SEC": "0.3",
         "FAKE_USAGE_DELAY": "0.3",
     }
     e.update(over)

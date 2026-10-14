@@ -479,6 +479,8 @@ CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not 
 : "${CR_STEP_GAP_SEC:=3}"              # between /clear and the resume phrase
 : "${CR_CLEAR_SETTLE_SEC:=5}"          # screen quiet this long after /clear counts as
                                         # confirmation on its own, without a rebind
+: "${CR_GATE_RETRY_SEC:=5}"            # a restart step held by a busy session or a
+                                        # person is looked at again this much later
 : "${CR_CONTEXT_COOLDOWN_SEC:=600}"    # silence after any restart, successful or not
 : "${CR_CONTEXT_MAX_CYCLES:=0}"        # 0 = no cap; >0 is a fuse against a loop
 # A session fresh out of a restart already carries a baseline (system prompt,
@@ -892,6 +894,14 @@ def _env(name, default, cast=str):
         return default
 
 
+def _env_positive(name, default):
+    """A float knob that sets how long to wait before looking again. Zero, a
+    negative number, nan or inf would turn the wait into a spin or a stall, so
+    any of them means the default -- the same as a value that does not parse."""
+    v = _env(name, default, float)
+    return v if 0 < v < float("inf") else default
+
+
 # No single number is "the" community consensus — recommendations run 40-70%,
 # with "around 60%" and "half the window" both common — but 51% is what this
 # project's own docs have suggested from the start and what every claude
@@ -976,6 +986,7 @@ CFG = dict(
     handoff_timeout=_env("CR_HANDOFF_TIMEOUT_SEC", 900.0, float),
     step_gap=_env("CR_STEP_GAP_SEC", 3.0, float),
     clear_settle=_env("CR_CLEAR_SETTLE_SEC", 5.0, float),
+    gate_retry=_env_positive("CR_GATE_RETRY_SEC", 5.0),
     context_cooldown=_env("CR_CONTEXT_COOLDOWN_SEC", 600.0, float),
     context_max_cycles=_env("CR_CONTEXT_MAX_CYCLES", 0, int),
     context_min_headroom=parse_tokens(os.environ.get("CR_CONTEXT_MIN_HEADROOM") or "80k") or 0,
@@ -4265,10 +4276,15 @@ class Controller:
     RESTART_DROP = 0.5     # the context has to at least halve for /clear to have worked
     BADGE_NEAR = 0.8       # show the percentage only once the threshold is in sight
     ESTIMATE_CONFIRM_FRAC = 0.6  # a guess that survives this much of itself is not a guess (T19)
-    GATE_RETRY = 5.0       # how long to sit on a held step before looking again
+    GATE_RETRY = 5.0       # held step: look again this much later, unless CR_GATE_RETRY_SEC says
     INTERRUPT_RETRY = 20.0 # between Escs, if the first did not close the turn
     HANDOFF_ECHO_RETRIES = 2   # retypes for a phrase that left no trace at all
     UNFOLD_STUCK = 60.0    # CLEARED held on the gate this long reads as stuck, not routine (T14)
+
+    @property
+    def gate_retry(self):
+        """How long to sit on a held step before looking again (CR_GATE_RETRY_SEC)."""
+        return self.cfg.get("gate_retry", self.GATE_RETRY)
 
     @property
     def context_enabled(self):
@@ -5119,7 +5135,7 @@ class Controller:
             if why:
                 self.log("restart step held: %s" % why)
         if why:
-            self.rwake = now + self.GATE_RETRY
+            self.rwake = now + self.gate_retry
         return why
 
     def _renotify(self, now, text):
@@ -7747,6 +7763,7 @@ export CR_CLAUDE_CLEAR_CMD CR_CODEX_CLEAR_CMD
 export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG
 export CR_CLAUDE_CANCEL_MSG CR_CODEX_CANCEL_MSG
 export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC CR_CLEAR_SETTLE_SEC
+export CR_GATE_RETRY_SEC
 export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
 export CR_CONTEXT_MIN_HEADROOM CR_CONTEXT_MAX_PER_HOUR CR_NOTIFY_REPEAT_SEC
 export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC

@@ -1033,9 +1033,24 @@ class TestTheRegistryStatusIsAnExtraBusySignal(RestartTestCase):
         self.assertIsNone(self.tick(ctl, 65))       # transcript alone would clear here
         ctl.on_agent_status("idle", 60)
         # T12: the latch already caught at t=65 regardless of busy, so what is
-        # being waited out here is `_send_clear`'s own backoff (GATE_RETRY),
+        # being waited out here is `_send_clear`'s own backoff (CR_GATE_RETRY_SEC),
         # not the busy status -- it flipped idle before this tick either way.
-        self.assertEqual(self.tick(ctl, 65 + ctl.GATE_RETRY), ("inject", "/clear", False))
+        self.assertEqual(self.tick(ctl, 65 + ctl.gate_retry), ("inject", "/clear", False))
+
+    def test_a_held_step_is_looked_at_again_after_cr_gate_retry_sec(self):
+        ctl = restart_controller(gate_retry=0.5)
+        self.fold(ctl)
+        self.folded(ctl, written_at=40)
+        ctl.on_agent_status("busy", 60)
+        self.assertIsNone(self.tick(ctl, 65))
+        self.assertEqual(ctl.rwake, 65.5)
+        ctl.on_agent_status("idle", 60)
+        self.assertIsNone(self.tick(ctl, 65.4))      # not yet: the wait is the knob's
+        self.assertEqual(self.tick(ctl, 65.5), ("inject", "/clear", False))
+
+    def test_without_the_knob_a_held_step_waits_the_old_five_seconds(self):
+        ctl = restart_controller()
+        self.assertEqual(ctl.gate_retry, 5.0)
 
     def test_a_stale_busy_status_is_not_trusted(self):
         ctl = restart_controller()
@@ -2365,6 +2380,16 @@ class TestSettingsAsPeopleWriteThem(unittest.TestCase):
     def test_nonsense_is_not_a_threshold(self):
         from helper import load as reload_impl
         self.assertEqual(reload_impl(CR_CONTEXT_TOKENS="lots").CFG["context_tokens"], 0)
+
+    def test_the_gate_retry_is_five_seconds_unless_set_to_something_that_waits(self):
+        # Zero or less would have the loop look again at once, forever; inf
+        # would never look again. Either falls back on the default, like garbage.
+        from helper import load as reload_impl
+        self.assertEqual(reload_impl().CFG["gate_retry"], 5.0)
+        self.assertEqual(reload_impl(CR_GATE_RETRY_SEC="0.3").CFG["gate_retry"], 0.3)
+        for written in ("0", "-1", "soon", "nan", "inf"):
+            self.assertEqual(reload_impl(CR_GATE_RETRY_SEC=written).CFG["gate_retry"], 5.0,
+                             written)
 
     def test_context_restart_is_off_by_default(self):
         from helper import load as reload_impl
