@@ -150,7 +150,7 @@ Windows is not supported (no pty).
 ## Tests
 
 ```sh
-./test/run.sh              # 888 tests: patterns, time parsing, transcript, model
+./test/run.sh              # 963 tests: patterns, time parsing, transcript, model
                            # windows, update checks, state machine, the badge, custom
                            # commands, degradation, end-to-end runs on a real pty
                            # (rendered through a terminal emulator, so "what the user

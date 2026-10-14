@@ -7,6 +7,44 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.0.5] - 2026-10-14
+
+### Fixed
+- A codex session is named by codex's own log, not guessed at. codex records
+  in `logs_2.sqlite` which process wrote which thread, the moment a thread is
+  made and long before its rollout exists; the wrapper now reads its session
+  from there. Two wrappers in one directory used to go wrong both ways: the
+  later one, whose rollout did not exist yet, bound to the earlier one's and
+  could type the fold phrase into an empty session on the neighbour's count;
+  the earlier one, seeing two candidates, held its restart until a fold
+  proved which was ours — and only a fold could, so it never folded again
+  (four such holds in the field, one for three days). Where the log cannot
+  say (an older codex) the hold now gives way after five minutes, between
+  turns only, and is called off if the echo lands elsewhere. A neighbour's
+  refused turn no longer nudges ours, and a rollout reopened by
+  `codex resume` is no longer read from its first byte, which replayed last
+  month's limit as today's.
+- `claude attach` follows the background session it names, and the roster
+  follows nothing. An attach is not a session of the process the wrapper
+  started — it runs in Claude Code's daemon — so it used to fall back to the
+  newest transcript in the directory, a neighbour's: one attach followed a
+  stranger for two days while its own session grew to 402k unread. It is now
+  named by its job (`~/.claude/jobs/<id>`), through `/clear` too.
+  `claude agents` has no transcript of its own: nothing there is counted,
+  folded or typed into; a limit is still waited out and shown.
+- The screen channel reads the screen. Claude Code paints only the cells that
+  changed and reaches each word with a cursor move, so the stream with its
+  escape codes stripped glued words together and lost the letters a repaint
+  stepped over. Where the screen is the deciding channel
+  (`CR_SCRAPE=always`, or before a session's transcript is found) it is now
+  read through a cell model of the terminal, and only what is on screen
+  counts: a banner that has scrolled away or been painted over no longer
+  does.
+
+### Added
+- `CR_GATE_RETRY_SEC` (5): how long a held restart step waits before it
+  looks again. Unchanged by default; the test suite sets it short.
+
 ## [3.0.4] - 2026-10-13
 
 ### Fixed
