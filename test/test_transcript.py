@@ -460,8 +460,9 @@ class TestBeforeTheRegistryHasNamedAnyone(unittest.TestCase):
         self.assertEqual([r["path"] for r in found if r["kind"] == "limit"], [w.current])
 
     def test_the_heuristic_gets_its_turn_when_the_wait_runs_out(self):
-        # A claude that writes no session file at all: an older build,
-        # `claude attach`, the roster. Said once, when it starts to matter.
+        # A claude that writes no session file at all: an older build. (Not
+        # `claude attach` or the roster any more — T33, below.) Said once,
+        # when it starts to matter.
         registry = FakeRegistry()
         registry.child_pid = 999
         w = self.watcher(registry)
@@ -834,6 +835,344 @@ class TestTwoWrappersStartedTogether(unittest.TestCase):
             self.assertEqual(self.ctl.context_path, self.path("ours"))
             self.assertEqual(self.ctl.context_tokens, 50000)
         self.assertFalse([ln for ln in self.logged if "rebound" in ln or "switched" in ln])
+
+
+# --------------------------------------------------------------------------- #
+# T33: `claude attach` and the roster are not a session of the child's
+# --------------------------------------------------------------------------- #
+JOB = "6cb059d2"                                  # the job of the field case, wrapper 45890
+JOB_SESSION = "6cb059d2-1300-4191-8dd7-442e082370cd"   # what it was dispatched under
+MOVED_ON = "f123d92c-b953-401e-92e6-925f41126da5"      # ...and the session it is after a /clear
+
+
+def registry_for(argv, child_pid, config_dir, **kw):
+    """The registry `main()` builds for a claude launched with `argv`.
+
+    Until T33 that was the same registry whatever the launch, and the attach
+    and the roster were named by its rules for a session of the child's own
+    — nobody, and then the growth heuristic. Asked of a build that predates
+    `claude_registry`, this builds exactly that, so a test below that fails
+    there fails on what that build did, not on a name it lacks.
+    """
+    kw.setdefault("proc_table", lambda: {})
+    if hasattr(cr, "claude_registry"):
+        reg = cr.claude_registry(child_pid, argv, cwd="/work", config_dir=config_dir,
+                                 log=kw.pop("log", None))
+        reg.proc_table = kw["proc_table"]
+        return reg
+    return cr.ClaudeSessionRegistry(child_pid, cwd="/work", config_dir=config_dir, **kw)
+
+
+class Jobs:
+    """`$CLAUDE_CONFIG_DIR` the way Claude Code's daemon lays it out:
+    `jobs/<8 hex>/state.json` per background session, and a background
+    session's own `sessions/<pid>.json` with `kind: "bg"` and `jobId`."""
+
+    def make_home(self):
+        self.home = tempfile.mkdtemp(prefix="cr-attach-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.sessions = os.path.join(self.home, "sessions")
+        os.makedirs(self.sessions)
+        self.logged = []
+
+    def project(self, cwd="/work"):
+        d = cr.project_dir(cwd, self.home)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def job(self, short, **state):
+        st = {"state": "working", "template": "bg", "sessionId": short + "-0000-4000-8000-000000000000",
+              "cwd": "/work", "name": "", "intent": "", "createdAt": "2026-09-29T08:45:03.766Z"}
+        st.update(state)
+        d = os.path.join(self.home, "jobs", short)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "state.json"), "w") as fh:
+            json.dump(st, fh)
+        return st
+
+    def bg(self, pid, short, session, **fields):
+        return session_record(self.sessions, pid, sessionId=session, kind="bg", jobId=short,
+                              **fields)
+
+
+class TestWhatALaunchIsNamedBy(Jobs, unittest.TestCase):
+    """`ClaudeSessionRegistry.lookup()` for the two launches that are not a
+    session of the child's own: `claude attach <id|name>`, and the roster."""
+
+    def setUp(self):
+        self.make_home()
+
+    def registry(self, argv, child_pid=111, **kw):
+        return registry_for(argv, child_pid, self.home, log=self.logged.append, **kw)
+
+    def test_an_attach_is_the_session_of_the_job_it_names(self):
+        self.job(JOB, sessionId=JOB_SESSION)
+        self.bg(333, JOB, JOB_SESSION)                    # the job's own, in the daemon
+        self.write_neighbour()
+        rec, why = self.registry(["attach", JOB]).lookup()
+        self.assertEqual(rec["sessionId"], JOB_SESSION)
+        self.assertEqual(why, "background job %s" % JOB)
+        self.assertEqual(rec["transcriptPath"],
+                         os.path.join(self.project(), JOB_SESSION + ".jsonl"))
+
+    def write_neighbour(self):
+        # Somebody else's session, started beside us after we were: the
+        # first thing the old fallback (and the rule before it) took.
+        session_record(self.sessions, 222, sessionId="1b900c55-theirs",
+                       startedAt=STARTED + 60000)
+
+    def test_the_attach_client_is_not_the_session_it_shows(self):
+        # Were the client ever to write a record of its own (one build fed
+        # `attach` a `--settings` and got a fresh session of its own out of
+        # it), that record describes the client, not the session on screen.
+        self.job(JOB, sessionId=JOB_SESSION)
+        self.bg(333, JOB, JOB_SESSION)
+        session_record(self.sessions, 111, sessionId="the-client-itself")
+        session_record(self.sessions, 112, sessionId="its-child")
+        reg = self.registry(["attach", JOB], proc_table=lambda: {112: 111})
+        self.assertEqual(reg.lookup()[0]["sessionId"], JOB_SESSION)
+
+    def test_nothing_else_ever_names_an_attach(self):
+        # The field case before its job could be read: wrapper 45890's
+        # session had no record naming its job, and a neighbour's did start.
+        self.job("0badf00d", sessionId="0badf00d-0000")
+        self.bg(444, "0badf00d", "another-job")          # somebody else's job
+        self.write_neighbour()
+        reg = self.registry(["attach", JOB])
+        for _ in range(3):
+            self.assertEqual(reg.lookup(), (None, None))
+        said = [ln for ln in self.logged if "claude attach %s" % JOB in ln]
+        self.assertEqual(len(said), 1, self.logged)
+        self.assertIn("no background job matches", said[0])
+
+    def test_any_unambiguous_start_of_the_id_will_do(self):
+        self.job(JOB, sessionId=JOB_SESSION)
+        self.job("6cf00000")
+        self.bg(333, JOB, JOB_SESSION)
+        self.assertEqual(self.registry(["attach", "6cb"]).lookup()[0]["sessionId"], JOB_SESSION)
+        self.assertEqual(self.registry(["attach", "6c"]).lookup(), (None, None))
+
+    def test_a_name_works_in_place_of_the_id(self):
+        self.job(JOB, sessionId=JOB_SESSION, name="iPhone подключение и очистка диска")
+        self.job("51759cbe", name="configure-model-and-effort")
+        self.bg(333, JOB, JOB_SESSION)
+        self.assertEqual(self.registry(["attach", "IPHONE"]).lookup()[0]["sessionId"],
+                         JOB_SESSION)
+
+    def test_a_name_two_jobs_share_names_neither(self):
+        # Claude Code lists both and exits; so does the child, then.
+        self.job(JOB, name="backlog task selection")
+        self.job("911654fe", name="iOS backlog tasks selection")
+        self.bg(333, JOB, JOB_SESSION)
+        reg = self.registry(["attach", "selection"])
+        self.assertEqual(reg.lookup(), (None, None))
+        self.assertTrue([ln for ln in self.logged if "2 background jobs match" in ln])
+
+    def test_text_that_could_start_an_id_is_never_read_as_a_name(self):
+        self.job(JOB, name="abc")                      # Claude Code: "Use more of the name."
+        self.bg(333, JOB, JOB_SESSION)
+        self.assertEqual(self.registry(["attach", "abc"]).lookup(), (None, None))
+
+    def test_the_job_says_which_session_it_is_when_no_record_does(self):
+        # A build whose background record has no `jobId`, or a session the
+        # attach is still waking: what the daemon resumes the job from.
+        elsewhere = self.project("/elsewhere")
+        scan = os.path.join(elsewhere, MOVED_ON + ".jsonl")
+        self.job(JOB, sessionId=JOB_SESSION, resumeSessionId=MOVED_ON, linkScanPath=scan,
+                 cwd="/elsewhere")
+        session_record(self.sessions, 333, sessionId=MOVED_ON, kind="bg")   # no jobId
+        rec, why = self.registry(["attach", JOB]).lookup()
+        self.assertEqual((rec["sessionId"], rec["transcriptPath"]), (MOVED_ON, scan))
+        self.assertIn("state.json", why)
+
+    def test_a_job_never_cleared_is_the_session_it_was_dispatched_as(self):
+        self.job(JOB, sessionId=JOB_SESSION)
+        rec, _ = self.registry(["attach", JOB]).lookup()
+        self.assertEqual(rec["sessionId"], JOB_SESSION)
+
+    def test_the_sessions_own_word_outranks_its_jobs(self):
+        self.job(JOB, sessionId=JOB_SESSION)              # not yet told of the /clear
+        self.bg(333, JOB, MOVED_ON)
+        self.assertEqual(self.registry(["attach", JOB]).lookup()[0]["sessionId"], MOVED_ON)
+
+    def test_a_respawn_overlapping_the_worker_it_replaces_is_the_one(self):
+        self.job(JOB)
+        self.bg(333, JOB, "the-old-worker", startedAt=1000)
+        self.bg(555, JOB, "the-respawn", startedAt=2000)
+        self.assertEqual(self.registry(["attach", JOB]).lookup()[0]["sessionId"], "the-respawn")
+
+    def test_the_transcript_is_where_the_session_writes_not_where_we_were_started(self):
+        self.job(JOB, cwd="/elsewhere")
+        self.bg(333, JOB, MOVED_ON, cwd="/elsewhere")
+        rec, _ = self.registry(["attach", JOB]).lookup()
+        self.assertEqual(rec["transcriptPath"],
+                         os.path.join(self.project("/elsewhere"), MOVED_ON + ".jsonl"))
+        # ...and a file the job's own linkScanPath points into wins over a
+        # directory worked out from a cwd (a worktree, a session that moved).
+        tree = self.project("/elsewhere/.claude/worktrees/x")
+        with open(os.path.join(tree, MOVED_ON + ".jsonl"), "w") as fh:
+            fh.write("{}\n")
+        self.job(JOB, cwd="/elsewhere", linkScanPath=os.path.join(tree, "older.jsonl"))
+        rec, _ = self.registry(["attach", JOB]).lookup()
+        self.assertEqual(rec["transcriptPath"], os.path.join(tree, MOVED_ON + ".jsonl"))
+
+    def test_the_roster_is_nobody_whatever_is_written(self):
+        session_record(self.sessions, 111, sessionId="the-roster-itself")
+        session_record(self.sessions, 112, sessionId="its-child")
+        self.write_neighbour()
+        reg = self.registry(["agents"], proc_table=lambda: {112: 111})
+        for _ in range(3):
+            self.assertEqual(reg.lookup(), (None, None))
+
+    def test_only_a_session_of_the_childs_own_may_be_guessed_at(self):
+        self.assertTrue(getattr(self.registry([]), "may_guess", True))
+        self.assertTrue(getattr(self.registry(["--continue"]), "may_guess", True))
+        for argv in (["attach", JOB], ["attach"], ["agents"], ["--debug", "agents"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(getattr(self.registry(argv), "may_guess", True))
+
+    def test_an_attach_with_nothing_to_attach_to_is_still_an_attach(self):
+        session_record(self.sessions, 111, sessionId="usage-and-exit")
+        self.assertEqual(self.registry(["attach"]).lookup(), (None, None))
+
+
+class TestAnAttachIsFollowedByItsJob(Jobs, unittest.TestCase):
+    """T33 from end to end, without a pty: the registry `main()` builds for
+    `claude attach 6cb059d2`, the real watcher and the real controller.
+
+    The field case, wrapper 45890 in voxik: the attached session's
+    transcript is older than the wrapper; a neighbour's interactive session
+    starts in the same directory while it runs. Its transcript is the fresh
+    one, and fresh is what the growth heuristic prefers."""
+
+    THRESHOLD = 510000
+    T0 = 1000.0
+
+    def setUp(self):
+        self.make_home()
+        self.dir = self.project()
+        self.typed = []
+
+    def start(self, argv=("attach", JOB), project=None):
+        cfg = dict(cr.CFG, context_tokens=self.THRESHOLD, wait_scale=1, margin=0,
+                   user_idle=0, root_idle=20, handoff_file=os.path.join(self.home, "handoff.md"))
+        self.ctl = cr.Controller(cfg, self.logged.append, now=self.T0)
+        self.reg = registry_for(list(argv), 111, self.home, log=self.logged.append)
+        self.w = cr.TranscriptWatcher(project or self.dir, poll=0, now=self.T0,
+                                      registry=self.reg, log=self.logged.append)
+
+    def row(self, path, rec):
+        with open(path, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def turn(self, at):
+        """One turn of the supervisor's loop, as `main()` takes it."""
+        w, ctl, now = self.w, self.ctl, self.T0 + at
+        recs = w.poll_now(now)
+        if w.current and w.current != ctl.context_path:
+            ctl.bind_transcript(w.current, "session identity" if w.bound_session_id
+                                else "fallback heuristic", now)
+        ctl.on_candidates(w.guessing and len(w.candidates) > 1 and not w.confirmed
+                          and not w.bound_session_id, now)
+        for rec in recs:
+            ours = rec["path"] == w.current
+            if rec["kind"] == "alive" and ours:
+                ctl.on_context(rec, now)
+                ctl.on_alive(now, "transcript", rec["path"])
+            elif rec["kind"] == "limit":
+                ctl.on_limit(rec["text"], now, "transcript" if ours else "neighbour")
+        ctl.note_growth(w.grown, now)
+        if w.agent_status is not None:
+            ctl.on_agent_status(w.agent_status, w.agent_status_at)
+        action = ctl.tick(now)
+        if action and action[0] == "inject":
+            self.typed.append(action[1])
+        return recs
+
+    def test_a_session_started_beside_an_attach_is_never_its_session(self):
+        ours = os.path.join(self.dir, MOVED_ON + ".jsonl")
+        theirs = os.path.join(self.dir, "1b900c55-theirs.jsonl")
+        self.row(ours, answered(400000, "claude-opus-5"))      # two days of history
+        self.job(JOB, sessionId=JOB_SESSION, resumeSessionId=MOVED_ON, linkScanPath=ours)
+        self.start()
+        self.row(ours, answered(402000, "claude-opus-5"))
+        self.turn(0.0)
+        self.assertEqual(self.w.current, ours)
+        session_record(self.sessions, 222, sessionId="1b900c55-theirs", startedAt=STARTED + 60000)
+        # The neighbour gets going, at a size that is past our threshold, and
+        # outlasts every wait there is; ours goes quiet in the meantime.
+        for at in (2.0, 31.0, 33.0, 120.0, 3600.0, 7200.0):
+            self.row(theirs, answered(700000, "claude-haiku-4-5"))
+            self.turn(at)
+            self.assertEqual(self.w.current, ours)
+            self.assertEqual(self.ctl.context_path, ours)
+            self.assertEqual(self.ctl.context_tokens, 402000)
+        self.turn(7300.0)                    # theirs quiet too: a fold would be due now
+        self.assertEqual(self.typed, [])
+        said = "\n".join(self.logged)
+        self.assertIn("session bound: %s (background job %s, from its state.json)"
+                      % (MOVED_ON, JOB), said)
+        for wrong in ("1b900c55", "falling back", "fallback heuristic", "700k", "folding"):
+            self.assertNotIn(wrong, said)
+        # ...and its own count, when it gets there, is the one that folds it.
+        self.row(ours, answered(520000, "claude-opus-5"))
+        self.turn(7310.0)
+        self.turn(7340.0)
+        self.assertEqual(len(self.typed), 1, self.logged)
+        self.assertIn("folding up", "\n".join(self.logged))
+
+    def test_a_clear_in_the_attached_session_moves_the_attach_with_it(self):
+        self.job(JOB, sessionId=JOB_SESSION)
+        self.bg(333, JOB, JOB_SESSION)
+        self.start()
+        self.turn(0.0)
+        self.assertEqual(self.w.current, os.path.join(self.dir, JOB_SESSION + ".jsonl"))
+        self.bg(333, JOB, MOVED_ON)                       # /clear: same process, new session
+        self.row(os.path.join(self.dir, MOVED_ON + ".jsonl"), answered(5000, "claude-opus-5"))
+        self.turn(2.0)
+        self.assertEqual(self.w.current, os.path.join(self.dir, MOVED_ON + ".jsonl"))
+        self.assertEqual(self.ctl.context_tokens, 5000)     # its first row, read
+        self.assertIn("session rebound: %s → %s (background job %s)" % (JOB_SESSION, MOVED_ON, JOB),
+                      "\n".join(self.logged))
+
+    def test_an_attach_from_another_directory_does_not_replay_the_sessions_past(self):
+        # `claude attach` run from home: the session writes under its own
+        # cwd, which the watcher never scanned, so nothing there was seeded.
+        elsewhere = self.project("/elsewhere")
+        ours = os.path.join(elsewhere, MOVED_ON + ".jsonl")
+        self.row(ours, REAL)                                  # yesterday's limit
+        self.row(ours, answered(400000, "claude-opus-5"))
+        self.job(JOB, cwd="/elsewhere")
+        self.bg(333, JOB, MOVED_ON, cwd="/elsewhere")
+        self.start()
+        recs = self.turn(0.0)
+        self.assertEqual(self.w.current, ours)
+        self.assertEqual(recs, [])
+        self.assertEqual(self.ctl.state, cr.IDLE)
+        self.row(ours, answered(450000, "claude-opus-5"))     # today's, read
+        self.turn(2.0)
+        self.assertEqual(self.ctl.context_tokens, 450000)
+        # After a /clear its new transcript is news from the first row — read
+        # a poll after the rebind, being in no directory the scan covers.
+        self.bg(333, JOB, "after-the-clear", cwd="/elsewhere")
+        self.row(os.path.join(elsewhere, "after-the-clear.jsonl"), answered(6000, "claude-opus-5"))
+        self.turn(4.0)
+        self.turn(6.0)
+        self.assertEqual(self.ctl.context_tokens, 6000)
+
+    def test_the_roster_follows_nothing_and_never_says_it_is_guessing(self):
+        self.start(argv=("agents",))
+        theirs = os.path.join(self.dir, "1b900c55-theirs.jsonl")
+        for at in (0.0, 2.0, 31.0, 33.0, 3600.0):
+            self.row(theirs, answered(700000, "claude-haiku-4-5"))
+            self.turn(at)
+            self.assertIsNone(self.w.current)
+            self.assertIsNone(self.ctl.context_path)
+        self.row(theirs, REAL)
+        self.assertEqual([r["kind"] for r in self.turn(3602.0)], ["limit"])   # still read
+        self.assertEqual(self.ctl.state, cr.WAITING)
+        self.assertEqual(self.typed, [])
+        self.assertFalse([ln for ln in self.logged if "falling back" in ln or "bound" in ln])
 
 
 class TestContextFigures(unittest.TestCase):

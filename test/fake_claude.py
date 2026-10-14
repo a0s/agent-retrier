@@ -43,7 +43,30 @@ It also writes `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, the way Claude Code
                       ever had to decide. Everything after it waits too: a
                       session is named before it writes a row.
   FAKE_SESSION_FILE   0 = never write it at all: a Claude Code older than the
-                      file, or a `claude attach`
+                      file
+
+Two launches are not a session of the fake's own (T33), and it plays both the
+way Claude Code 2.1.294 does:
+
+  `attach <id>`     when `$CLAUDE_CONFIG_DIR/jobs/` has exactly one job whose
+                    name starts with <id> (the test lays it out, as the daemon
+                    would have): the fake is the attach client and that job's
+                    background session at once. It writes NO record under its
+                    own pid — the client never does — and keeps the job's own
+                    up to date instead: `sessions/<pid>.json` with
+                    `kind: "bg"`, `jobId`, written under a pid that is nobody's
+                    child, and on `/clear` the job's `state.json`
+                    (`resumeSessionId`, `linkScanPath`) too. Everything it
+                    writes goes into the job's transcript, under the job's
+                    cwd. With no such job it is the plain fake, so a test that
+                    only looks at argv still can.
+  FAKE_BG_RECORD    0 = leave the job's background record alone: a build
+                    whose record has no `jobId`, so only `state.json` says
+                    which session the job is
+  `agents`          the roster: draws its header, writes no record and no
+                    transcript of its own, and answers every line it is
+                    typed with GOT: — in the real one, Enter in that box
+                    dispatches a new session
 
 For T27 (the subagent tree overlay) it can also draw two rows of Claude Code's
 own subagent tree and back them with real `subagents/agent-*.{meta.json,jsonl}`
@@ -94,14 +117,101 @@ _TARGET = re.compile(r"handoff to `([^`]+)`")
 SESSION = ["fake-session"]
 STARTED_AT = [None]
 DROP_NEXT_FOLD = [False]
+CWD = [None]          # whose project the transcript is under: ours, or an attached job's
+ATTACHED = [None]     # the job `attach` named (T33)
+ROSTER = [False]      # `agents`: no session of its own at all (T33)
+
+
+def config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 
 
 def project_dir():
-    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-    slug = re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
-    d = os.path.join(cfg, "projects", slug)
+    slug = re.sub(r"[^A-Za-z0-9]", "-", CWD[0] or os.getcwd())
+    d = os.path.join(config_dir(), "projects", slug)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def job_dir(job):
+    return os.path.join(config_dir(), "jobs", job)
+
+
+def read_job_state(job):
+    with open(os.path.join(job_dir(job), "state.json")) as fh:
+        return json.load(fh)
+
+
+def write_job_state(job, state):
+    path = os.path.join(job_dir(job), "state.json")
+    with open(path + ".tmp", "w") as fh:
+        json.dump(state, fh)
+    os.replace(path + ".tmp", path)
+
+
+def attach_to(argv):
+    """`attach <id>` -> take on the job's session, or stay the plain fake.
+
+    The id is resolved the way Claude Code resolves it: the one job whose
+    directory name starts with it."""
+    if len(argv) < 2 or argv[0] != "attach":
+        return
+    try:
+        jobs = [n for n in os.listdir(os.path.join(config_dir(), "jobs"))
+                if re.match(r"^[0-9a-f]{8}$", n) and n.startswith(argv[1])]
+    except OSError:
+        return
+    if len(jobs) != 1:
+        return
+    state = read_job_state(jobs[0])
+    ATTACHED[0] = jobs[0]
+    SESSION[0] = state.get("resumeSessionId") or state["sessionId"]
+    CWD[0] = state.get("cwd") or os.getcwd()
+
+
+def bg_record_path():
+    """The attached job's own record: the one already there if the test laid
+    one out, or one under a pid nobody started — the daemon's worker is no
+    child of ours either."""
+    sessions = sessions_dir()
+    for name in os.listdir(sessions):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(sessions, name)) as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("kind") == "bg" and rec.get("jobId") == ATTACHED[0]:
+            return os.path.join(sessions, name)
+    return os.path.join(sessions, "%d.json" % (4000000 + os.getpid()))
+
+
+def write_bg_record(status):
+    if os.environ.get("FAKE_BG_RECORD", "1") == "0":
+        return
+    path = bg_record_path()
+    rec = {"pid": int(os.path.basename(path)[:-5]), "sessionId": SESSION[0], "cwd": CWD[0],
+           "startedAt": STARTED_AT[0], "version": "1.0.0-fake", "kind": "bg",
+           "jobId": ATTACHED[0], "name": ATTACHED[0], "status": status,
+           "statusUpdatedAt": int(time.time() * 1000)}
+    try:
+        with open(path) as fh:
+            old = json.load(fh)
+        rec["pid"], rec["startedAt"] = old.get("pid", rec["pid"]), old.get("startedAt", rec["startedAt"])
+    except (OSError, ValueError):
+        pass
+    with open(path + ".tmp", "w") as fh:
+        json.dump(rec, fh)
+    os.replace(path + ".tmp", path)
+
+
+def draw_roster(out):
+    """The two things `CR_ROSTER_PATTERNS` know a roster by, and nothing
+    that is anybody's session."""
+    out.write("1 awaiting input · 2 working\r\n")
+    out.write("> describe a task for a new session\r\n")
+    out.flush()
 
 
 def transcript_path():
@@ -126,6 +236,11 @@ def write_pid_file(status):
     Code 2.1.273 (see T02's "Verified" section): `startedAt`/`statusUpdatedAt`
     are epoch milliseconds, not ISO strings.
     """
+    if ROSTER[0]:
+        return                       # the roster is nobody's session (T33)
+    if ATTACHED[0]:
+        write_bg_record(status)      # ...and the attach client is not one either
+        return
     if os.environ.get("FAKE_SESSION_FILE", "1") == "0":
         return
     rec = {"pid": os.getpid(), "sessionId": SESSION[0], "cwd": os.getcwd(),
@@ -139,6 +254,8 @@ def write_pid_file(status):
 
 
 def remove_pid_file():
+    if ATTACHED[0]:
+        return        # detaching leaves the session running: "The session keeps running either way"
     try:
         os.unlink(pid_file_path())
     except OSError:
@@ -146,6 +263,8 @@ def remove_pid_file():
 
 
 def write_transcript(text, limited=True, tokens=None, stop_reason=None, model=None, synthetic=False):
+    if ROSTER[0]:
+        return                       # the roster has no transcript to write into
     msg = {"role": "assistant", "content": [{"type": "text", "text": text}]}
     msg_model = "<synthetic>" if synthetic else (model or os.environ.get("FAKE_MODEL", "claude-opus-5"))
     if msg_model:
@@ -414,6 +533,21 @@ def main():
         out.write("winsize unknown\r\n")
     out.flush()
 
+    # `--settings` takes a value (the statusline proxy's JSON, T20), and a
+    # roster started with one in front of it is still the roster.
+    positional, skip = [], False
+    for a in sys.argv[1:]:
+        if skip:
+            skip = False
+        elif a == "--settings":
+            skip = True
+        elif not a.startswith("-"):
+            positional.append(a)
+    ROSTER[0] = bool(positional) and positional[0] == "agents"
+    attach_to(positional)
+    if ROSTER[0]:
+        draw_roster(out)
+
     time.sleep(float(os.environ.get("FAKE_SESSION_DELAY", "0")))
     write_pid_file("idle")
     run_script(os.environ.get("FAKE_SCRIPT"))
@@ -489,6 +623,14 @@ def main():
             if not line:
                 continue                      # an empty box: Claude Code ignores it too
             write_pid_file("busy")
+            if ROSTER[0]:
+                # No session here to write it into: in the real roster, Enter
+                # in that box dispatches a brand new session with this text.
+                if line.startswith("quit"):
+                    break
+                out.write("GOT:%s\r\n" % line)
+                out.flush()
+                continue
             # The one line that may not get an echo at all: `dropfirstfold`
             # (DROP_NEXT_FOLD) stands in for a popup eating the keystrokes or a
             # write that never landed -- nothing reaches the session, so
@@ -542,6 +684,12 @@ def main():
                 time.sleep(float(os.environ.get("FAKE_CLEAR_DELAY", "0")))
                 SESSION[0] = "fake-session-%d" % (int(time.time() * 1000) % 100000)
                 write_pid_file("busy")         # sessionId changed under the same pid
+                if ATTACHED[0]:
+                    # A background session also tells its job where it went,
+                    # which is what the daemon resumes it from next time.
+                    state = read_job_state(ATTACHED[0])
+                    state.update(resumeSessionId=SESSION[0], linkScanPath=transcript_path())
+                    write_job_state(ATTACHED[0], state)
                 out.write("GOT:/clear\r\n")
                 out.flush()
                 continue

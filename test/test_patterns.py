@@ -180,6 +180,27 @@ class TestWrappingTheRosterItself(unittest.TestCase):
         self.assertFalse(cr.is_roster_launch(["fix the tests", "agents"]))
 
 
+class TestWhatAnAttachNames(unittest.TestCase):
+    """`claude attach <id|name>` names its session on our own command line
+    (T33): the one word after `attach`, an id prefix or a name."""
+
+    def test_the_word_after_attach(self):
+        self.assertEqual(cr.attach_target(["attach", "6cb059d2"]), "6cb059d2")
+        self.assertEqual(cr.attach_target(["--debug", "attach", "6cb"]), "6cb")
+        self.assertEqual(cr.attach_target(["attach", "iPhone и диск"]), "iPhone и диск")
+
+    def test_no_word_or_a_flag_is_no_target(self):
+        for argv in (["attach"], ["attach", "--help"], ["attach", ""]):
+            with self.subTest(argv=argv):
+                self.assertIsNone(cr.attach_target(argv))
+
+    def test_anything_else_is_not_an_attach(self):
+        for argv in ([], ["agents"], ["--continue"], ["attach the logs please"],
+                     ["fix it", "attach", "x"]):
+            with self.subTest(argv=argv):
+                self.assertIsNone(cr.attach_target(argv))
+
+
 class TestWorkingDetection(unittest.TestCase):
     def test_streaming_footer_is_working(self):
         for text in ["✻ Cogitating… (esc to interrupt)",

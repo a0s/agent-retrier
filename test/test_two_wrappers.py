@@ -41,6 +41,47 @@ def _gone(pid):
     return False
 
 
+JOB = "6cb059d2"
+JOB_SESSION = "f123d92c-b953-401e-92e6-925f41126da5"
+
+
+def lay_out_job(cfg_dir, cwd, history_tokens=400000, record=True):
+    """A background job, the way Claude Code's daemon leaves one before
+    anybody attaches to it (T33): `jobs/<id>/state.json`, the session's
+    transcript under the job's cwd — older than any wrapper started after
+    it, with the history to show for it — and the session's own
+    `sessions/<pid>.json` (`kind: "bg"`, `jobId`), written by a daemon
+    worker that is no process of ours."""
+    slug = "".join(c if c.isalnum() else "-" for c in os.path.realpath(cwd))
+    project = os.path.join(cfg_dir, "projects", slug)
+    os.makedirs(project, exist_ok=True)
+    transcript = os.path.join(project, JOB_SESSION + ".jsonl")
+    with open(transcript, "w") as fh:
+        fh.write(json.dumps({
+            "type": "assistant", "isSidechain": False, "message": {
+                "role": "assistant", "model": "claude-opus-5", "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "cache_creation_input_tokens": 1000,
+                          "cache_read_input_tokens": history_tokens - 1002,
+                          "output_tokens": 10},
+                "content": [{"type": "text", "text": "two days of work"}]}}) + "\n")
+    job = os.path.join(cfg_dir, "jobs", JOB)
+    os.makedirs(job, exist_ok=True)
+    with open(os.path.join(job, "state.json"), "w") as fh:
+        json.dump({"state": "working", "template": "bg", "cwd": os.path.realpath(cwd),
+                   "sessionId": JOB + "-1300-4191-8dd7-442e082370cd",
+                   "resumeSessionId": JOB_SESSION, "linkScanPath": transcript,
+                   "name": "iPhone and the disk"}, fh)
+    if record:
+        sessions = os.path.join(cfg_dir, "sessions")
+        os.makedirs(sessions, exist_ok=True)
+        with open(os.path.join(sessions, "3999999.json"), "w") as fh:
+            json.dump({"pid": 3999999, "sessionId": JOB_SESSION, "cwd": os.path.realpath(cwd),
+                       "startedAt": int(time.time() * 1000) - 86400000, "kind": "bg",
+                       "jobId": JOB, "status": "idle",
+                       "statusUpdatedAt": int(time.time() * 1000)}, fh)
+    return transcript
+
+
 class TwoWrappersTestCase(unittest.TestCase):
     def two(self, cfg_a=None, cfg_b=None):
         d = tempfile.mkdtemp(prefix="cr-two-test-")
@@ -54,6 +95,22 @@ class TwoWrappersTestCase(unittest.TestCase):
         a = helper.one_wrapper(d, cfg or {"agent": "claude"})
         self.addCleanup(a.close)
         return a
+
+    def over_a_job(self, cfg_a, cfg_b=None, **job):
+        """`a` started on a background job laid out beforehand (T33), and —
+        given `cfg_b` — `b`, an ordinary session started beside it after
+        it, in the same directory and the same `$CLAUDE_CONFIG_DIR`."""
+        d = tempfile.mkdtemp(prefix="cr-two-test-")
+        log, home = helper._shared_home()
+        self.job_transcript = lay_out_job(home["CLAUDE_CONFIG_DIR"], d, **job)
+        a = helper.WrapperSession(cwd=d, log=log, env=dict(home, **cfg_a))
+        self.addCleanup(a.close)
+        if cfg_b is None:
+            return a, None
+        self.assertTrue(a.read_until("ready"))
+        b = helper.WrapperSession(cwd=d, log=log, env=dict(home, **cfg_b))
+        self.addCleanup(b.close)
+        return a, b
 
 
 class TestTwoWrappers(TwoWrappersTestCase):
@@ -251,7 +308,8 @@ class TestTwoWrappers(TwoWrappersTestCase):
 
     def test_a_claude_that_writes_no_session_file_is_still_followed(self):
         # The case the wait must not strand: a Claude Code older than the
-        # file, or `claude attach`. Nobody is ever named, so once the wait is
+        # file (`claude attach` is named by its job now, T33, below). Nobody
+        # is ever named, so once the wait is
         # over the growth heuristic takes it from there, as it always did —
         # and the session is folded on its own count.
         base = helper.restart_timers(agent="claude", CR_CONTEXT_TOKENS="510000",
@@ -284,6 +342,130 @@ class TestTwoWrappers(TwoWrappersTestCase):
         self.assertIn("limit detected (", lines)
         self.assertNotIn("falling back", lines)      # still inside the thirty seconds
         self.assertNotIn("context bound", lines)
+
+    # -- T33: `claude attach` and the roster are no session of the child's ---- #
+    def test_an_attach_follows_its_job_and_never_folds_on_a_neighbour(self):
+        # Wrapper 45890, voxik, with the clock turned down. a is `claude
+        # attach 6cb059d2`: its session is the job's, at 50k, in a transcript
+        # older than a. b is somebody else's session, started beside it after
+        # it, at 700k. The attach client writes no record of its own, so
+        # until T33 a waited for one, gave up, and let the heuristic choose —
+        # and the heuristic prefers the transcript that did not exist when a
+        # started, which is b's: a folded its own session on b's count.
+        base = helper.restart_timers(agent="claude", CR_CONTEXT_TOKENS="510000",
+                                     FAKE_MODEL="claude-opus-5", CR_SESSION_GRACE_SEC="1")
+        a, b = self.over_a_job(dict(base, args=["attach", JOB], FAKE_USAGE="50000"),
+                               dict(base, FAKE_USAGE="700000", FAKE_USAGE_DELAY="1.5"))
+        self.assertTrue(b.read_until("ready"))
+        b_own = "fake-session-%d" % b.agent_pid()
+        self.assertTrue(helper.eventually(lambda: self.rows(b, b_own) >= 2, timeout=15))
+        time.sleep(helper.LEFT_ALONE)       # b quiet: when a bound to b would fold
+        self.assertTrue(a.roundtrip(), a.buf[-500:])
+        self.assertNotIn("GOT:handoff", a.buf)
+        lines = "".join(a.log_lines())
+        self.assertIn("session bound: %s (background job %s)" % (JOB_SESSION, JOB), lines)
+        for wrong in (b_own, "fallback heuristic", "falling back", "folding up", "700k"):
+            self.assertNotIn(wrong, lines)
+
+    def test_an_attach_folds_its_own_session_and_goes_through_the_clear_with_it(self):
+        # What must go on working: an attach above its threshold is folded on
+        # its own count, and the `/clear` moves it to the session's new
+        # transcript the way it moves any session — its record says so.
+        base = helper.restart_timers(agent="claude", CR_CONTEXT_TOKENS="510000",
+                                     FAKE_MODEL="claude-opus-5")
+        a, _ = self.over_a_job(dict(base, args=["attach", JOB], FAKE_USAGE="700000"))
+        self.assertTrue(a.read_until("GOT:handoff", timeout=20), a.buf[-500:])
+        self.assertTrue(a.read_until("GOT:/clear", timeout=30), a.buf[-500:])
+        self.assertTrue(a.read_until("GOT:resume", timeout=30), a.buf[-500:])
+        lines = "".join(a.log_lines())
+        self.assertIn("session bound: %s (background job %s)" % (JOB_SESSION, JOB), lines)
+        self.assertIn("session rebound: %s → fake-session-" % JOB_SESSION, lines)
+        self.assertIn("(background job %s)" % JOB, lines.split("session rebound: ", 1)[1])
+        self.assertTrue(helper.eventually(
+            lambda: "context restarted" in "".join(a.log_lines()), timeout=15))
+
+    def test_an_attach_whose_job_has_no_record_is_named_by_the_jobs_state(self):
+        # A build whose background record carries no `jobId`: the job's own
+        # state.json, which the session keeps up to date across a /clear.
+        base = helper.restart_timers(agent="claude", CR_CONTEXT_TOKENS="510000",
+                                     FAKE_MODEL="claude-opus-5", FAKE_BG_RECORD="0")
+        a, _ = self.over_a_job(dict(base, args=["attach", JOB], FAKE_USAGE="700000"),
+                               record=False)
+        self.assertTrue(a.read_until("GOT:handoff", timeout=20), a.buf[-500:])
+        self.assertTrue(a.read_until("GOT:resume", timeout=45), a.buf[-500:])
+        lines = "".join(a.log_lines())
+        self.assertIn("session bound: %s (background job %s, from its state.json)"
+                      % (JOB_SESSION, JOB), lines)
+        self.assertIn("session rebound: %s → fake-session-" % JOB_SESSION, lines)
+
+    def rows(self, s, session):
+        """How many rows `session`'s transcript has, wherever `s`'s claude
+        config keeps it (0 before it exists)."""
+        projects = os.path.join(os.path.dirname(s.log), "claude-config", "projects")
+        for root, _dirs, files in os.walk(projects):
+            if session + ".jsonl" in files:
+                with open(os.path.join(root, session + ".jsonl")) as fh:
+                    return len(fh.readlines())
+        return 0
+
+    def typed_into(self, s):
+        """Every line `s`'s fake was handed that the test did not type itself."""
+        return [ln for ln in s.buf.replace("\r", "\n").split("\n")
+                if ln.startswith("GOT:") and not ln.startswith("GOT:tick-")]
+
+    def test_the_roster_follows_no_transcript_and_folds_into_nothing(self):
+        # a is `claude agents`: no session of its own and no transcript. Until
+        # T33 it waited for a session file it would never get and handed the
+        # directory to the heuristic, which took b's — and folded it. The fold
+        # phrase went into the roster's one input box, which in the real
+        # roster starts a new session with it. (b's own threshold is out of
+        # reach, so that b's transcript goes quiet after its two rows.)
+        base = helper.restart_timers(agent="claude", FAKE_MODEL="claude-opus-5",
+                                     CR_SESSION_GRACE_SEC="1")
+        a, b = self.two(dict(base, args=["agents"], CR_CONTEXT_TOKENS="510000"),
+                        dict(base, CR_CONTEXT_TOKENS="900000", FAKE_USAGE="700000",
+                             FAKE_USAGE_DELAY="1.5"))
+        self.assertTrue(a.read_until("describe a task for a new session"))
+        self.assertTrue(b.read_until("ready"))
+        b_own = "fake-session-%d" % b.agent_pid()
+        self.assertTrue(helper.eventually(lambda: self.rows(b, b_own) >= 2, timeout=15))
+        time.sleep(helper.LEFT_ALONE)
+        a.read_until("(nothing)", timeout=0.5)        # whatever it was typed by now
+        self.assertEqual(self.typed_into(a), [])
+        self.assertTrue(a.roundtrip(), a.buf[-500:])
+        self.assertEqual(self.typed_into(a), [])
+        lines = "".join(a.log_lines())
+        self.assertIn("the agent roster is no session of ours", lines)
+        for wrong in ("context bound", "session bound", "falling back", "folding up", "700k"):
+            self.assertNotIn(wrong, lines)
+
+    def test_the_roster_types_nothing_when_a_limit_lifts(self):
+        # b runs into the limit; it is the account's, and the roster reads it
+        # and shows it. When it lifts, "continue" used to be typed into the
+        # roster's box — a new session — and twice more when nothing came of
+        # it.
+        base = {"agent": "claude", "CR_SCRAPE": "never", "CR_WAIT_SCALE": "3600",
+                "CR_MARGIN_SEC": "0", "CR_USER_IDLE_SEC": "0", "CR_POLL_SEC": "0.2",
+                "CR_VERIFY_SEC": "1"}
+        a, b = self.two(dict(base, args=["agents"]),
+                        dict(base, FAKE_TRANSCRIPT="You've hit your session limit - resets in 1 hours"))
+        self.assertTrue(a.read_until("describe a task for a new session"))
+        self.assertTrue(helper.eventually(
+            lambda: "limit detected (neighbour)" in "".join(a.log_lines()), timeout=15),
+            "".join(a.log_lines()))
+        # One second (an hour, scaled), then the moment a retry would go out,
+        # and then the two more it would have taken.
+        self.assertTrue(helper.eventually(
+            lambda: "nothing typed" in "".join(a.log_lines())
+            or "sending retry" in "".join(a.log_lines()), timeout=15))
+        time.sleep(2.5)
+        a.read_until("(nothing)", timeout=0.5)        # whatever it was typed by now
+        self.assertEqual(self.typed_into(a), [])
+        self.assertTrue(a.roundtrip(), a.buf[-500:])
+        self.assertEqual(self.typed_into(a), [])
+        lines = "".join(a.log_lines())
+        self.assertIn("the limit is over; nothing typed", lines)
+        self.assertNotIn("sending retry", lines)
 
     def test_only_the_session_above_the_threshold_is_folded(self):
         # The bug T02 removes: without registry-based identity, a's watcher

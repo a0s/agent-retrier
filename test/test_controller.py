@@ -608,6 +608,54 @@ class TestVerifyAndGiveUp(unittest.TestCase):
         self.assertIsNotNone(ctl.tick(8000 + 10801))
 
 
+class TestNothingIsTypedIntoTheRoster(unittest.TestCase):
+    """T33. `claude agents` is a list of other sessions, with one input box:
+    Enter in it dispatches a NEW session with whatever was typed. A limit
+    read off this directory's transcripts used to be answered there —
+    "continue" typed into that box, and again on each retry, three new
+    sessions by the time the retries gave up — or into whichever session was
+    open on the roster, which nothing had identified. The wait is still the
+    account's and is still shown; what it ends in is nothing typed."""
+
+    def roster(self, **over):
+        ctl = controller(user_idle=0, **over)
+        ctl.hands_off = "this is the agent roster, not a session of ours"
+        return ctl
+
+    def test_a_limit_is_waited_out_and_nothing_is_typed(self):
+        ctl = self.roster()
+        self.assertTrue(ctl.on_limit(BANNER, now=0, source="neighbour"))
+        self.assertEqual(ctl.state, cr.WAITING)
+        for t in (7201, 7262, 7323, 7384, 9000):
+            self.assertIsNone(ctl.tick(t))
+        self.assertEqual(ctl.state, cr.IDLE)
+        said = [ln for ln in ctl.log_lines if "nothing typed" in ln]
+        self.assertEqual(len(said), 1, ctl.log_lines)
+        self.assertIn("the limit is over; nothing typed: this is the agent roster", said[0])
+        self.assertFalse([ln for ln in ctl.log_lines if "sending retry" in ln])
+
+    def test_a_stall_is_not_nudged_either(self):
+        ctl = self.roster(stall_wait=60, stall_backoff=2, stall_max_wait=600,
+                          stall_max_attempts=5)
+        self.assertTrue(ctl.on_stall("Selected model is at capacity", now=0, source="transcript"))
+        for t in (61, 200, 2000):
+            self.assertIsNone(ctl.tick(t))
+        self.assertTrue([ln for ln in ctl.log_lines if "the stall is over; nothing typed" in ln])
+
+    def test_the_next_limit_is_still_read(self):
+        ctl = self.roster()
+        ctl.on_limit(BANNER, now=0, source="neighbour")
+        ctl.tick(7201)
+        self.assertTrue(ctl.on_limit("resets in 3 hours", now=8000, source="neighbour"))
+        self.assertEqual(ctl.state, cr.WAITING)
+        self.assertIsNone(ctl.tick(8000 + 10801))
+
+    def test_a_session_still_types(self):
+        ctl = controller(user_idle=0)
+        ctl.on_limit(BANNER, now=0, source="neighbour")
+        self.assertEqual(ctl.tick(7201)[0], "inject")
+
+
 class TestARetryThatWorkedIsNotRepeated(unittest.TestCase):
     """Field failure: the reset came, `continue` went out and claude resumed —
     and the wrapper typed it twice more and then painted "cr stopped", because

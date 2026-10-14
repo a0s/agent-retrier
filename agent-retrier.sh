@@ -1839,16 +1839,57 @@ class ClaudeSessionRegistry:
     third, and not one claude of the kind it was written for. Naming nobody
     is the answer it should have given, and is the answer now:
     `TranscriptWatcher` knows what to do with that, and it is not to guess.
+
+    Two launches are not a session of the child's at all (T33), and for
+    both the watcher's fallback, once the wait runs out, was the one guess
+    left — the one that took a neighbour's transcript and kept it:
+
+    - `claude attach <id|name>` (`attach`) opens a *background* session. That
+      session runs in Claude Code's daemon, as a process of the daemon's and
+      not of ours, and the attach client we forked writes no record of its
+      own (wrapper 45890: `no session registry for pid 45932`, then two days
+      on the heuristic). But the session does write one: a background
+      session's `sessions/<pid>.json` carries `kind: "bg"` and
+      `jobId: "<8 hex>"` — the name of its directory under `jobs/`, which is
+      exactly what `attach` resolves its argument to. Claude Code itself
+      goes from a session to its job by those two fields. So an attach is
+      bound by the job named on our own command line, and by nothing else:
+      the record that names that job, or — a build whose record has no
+      `jobId` — the job's own `state.json`, where the session keeps
+      `resumeSessionId`/`linkScanPath` current across a `/clear`.
+    - `claude agents` (`roster`) is a list of OTHER sessions. It has no
+      transcript of its own, and whichever session is opened on it was
+      never identified. It is named nothing, ever.
+
+    Neither may fall back to the growth heuristic (`may_guess`): a session
+    we cannot name is one we follow nothing of.
     """
 
-    def __init__(self, child_pid, cwd=None, config_dir=None, log=None, proc_table=None):
+    JOB_ID = re.compile(r"^[0-9a-f]{8}$")     # a directory under jobs/, as attach lists them
+    HEXISH = re.compile(r"^[0-9a-f]{1,8}$")   # ...and a target that can only be the start of one
+
+    def __init__(self, child_pid, cwd=None, config_dir=None, log=None, proc_table=None,
+                 attach=None, roster=False):
         self.child_pid = child_pid
         self.cwd = cwd or os.getcwd()
         base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+        self.base = base
         self.dir = os.path.join(base, "sessions")
+        self.jobs = os.path.join(base, "jobs")
         self.log = log or (lambda *_: None)
         self.proc_table = proc_table or self._ps_table
         self._logged_ambiguous = False
+        self.attach = attach            # `claude attach`'s own argument
+        self.roster = roster
+        self.job = None                 # the job `attach` resolves to, once it has
+        self._said_unresolved = False
+        # May the watcher guess for us once we have had our time? Only for the
+        # child's own session: a claude old enough to write no record is still
+        # the one we forked, and the heuristic can still find its transcript.
+        # An attach's session is somebody else's process and its transcript is
+        # older than we are — the heuristic prefers a fresh file, which is
+        # exactly a neighbour's — and the roster has no transcript to find.
+        self.may_guess = not (attach is not None or roster)
 
     def _read(self, pid):
         """One record, or None for anything that is not one.
@@ -1926,26 +1967,23 @@ class ClaudeSessionRegistry:
         launch), the file just removed (claude on its way out), or no file
         ever. Which of those it is only time can say, and the one who is
         counting is `TranscriptWatcher`.
+
+        The roster is never named, and an attach only by its job (see the
+        class): the child's own record, were the attach client ever to write
+        one, would describe the client, not the session it shows.
         """
+        if self.roster:
+            return None, None
+        if self.attach is not None:
+            return self._attached()
         direct = self._read(self.child_pid)
         if direct:
             self._logged_ambiguous = False
             return direct, "pid file"
-        try:
-            names = os.listdir(self.dir)
-        except OSError:
-            names = []
         table = None
         matches = []
-        for name in names:
-            if not name.endswith(".json"):
-                continue
-            try:
-                pid = int(name[:-5])
-            except ValueError:
-                continue
-            rec = self._read(pid)
-            if not rec or rec.get("cwd") != self.cwd:
+        for pid, rec in self._records():
+            if rec.get("cwd") != self.cwd:
                 continue
             if table is None:
                 table = self.proc_table()
@@ -1962,6 +2000,143 @@ class ClaudeSessionRegistry:
             return None, None
         self._logged_ambiguous = False
         return None, None
+
+    def _records(self):
+        """Every `(pid, record)` in `sessions/`, in no particular order."""
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                pid = int(name[:-5])
+            except ValueError:
+                continue
+            rec = self._read(pid)
+            if rec:
+                yield pid, rec
+
+    # -- `claude attach` (T33) ------------------------------------------------ #
+    def _attached(self):
+        """The session of the job `claude attach` was given, or nobody.
+
+        Its own record first — what the running session says it is right
+        now, `/clear` included, with the busy/idle the controller can use —
+        and the job's `state.json` only when no record names the job: a
+        build whose background record predates `jobId`, or a session that is
+        not running yet because the attach is waking it. Both describe that
+        one job and nothing else; the worst either can be is a moment behind
+        it, never a neighbour.
+        """
+        job = self._resolve_job()
+        if job is None:
+            return None, None
+        state = self._job_state(job)
+        best = None
+        for _pid, rec in self._records():
+            if rec.get("kind") != "bg" or rec.get("jobId") != job:
+                continue
+            if not isinstance(rec.get("sessionId"), str) or not rec["sessionId"]:
+                continue
+            # A respawn can overlap the worker it replaces for a moment; both
+            # are this job's, and the one started last is the one running it.
+            started = rec.get("startedAt") if isinstance(rec.get("startedAt"), (int, float)) else 0
+            if best is None or started > best[0]:
+                best = (started, rec)
+        if best is not None:
+            rec = best[1]
+            path = self._transcript_for(rec["sessionId"], rec.get("cwd"), state)
+            return dict(rec, transcriptPath=path), "background job %s" % job
+        if state is None:
+            return None, None
+        # What the daemon itself resumes the job from: `resumeSessionId` once
+        # the session has moved off the id it was dispatched under.
+        sid = state.get("resumeSessionId") or state.get("sessionId")
+        if not isinstance(sid, str) or not re.match(r"^[0-9A-Za-z-]{8,}$", sid):
+            return None, None
+        path = self._transcript_for(sid, state.get("cwd"), state)
+        return ({"sessionId": sid, "cwd": state.get("cwd"), "transcriptPath": path},
+                "background job %s, from its state.json" % job)
+
+    def _resolve_job(self):
+        """`claude attach`'s argument as the job directory it names, the way
+        Claude Code resolves it — or None, said once.
+
+        An id is any unambiguous start of a job's 8-hex name. Anything that
+        is not hex is a name, matched case-insensitively against each job's
+        `name`; Claude Code ranks an exact name over part of one and part of
+        one over the task text, and opens a session by name only when one
+        name matches. Taking only a name that is the sole job to contain the
+        text agrees with it whenever it opens anything at all: where it would
+        list several and exit, so does this, and then so has the child.
+        Asked again on every poll until it answers — a job is not expected
+        to appear later, but asking costs a directory listing.
+        """
+        if self.job is not None:
+            return self.job
+        target = self.attach or ""
+        try:
+            names = sorted(n for n in os.listdir(self.jobs) if self.JOB_ID.match(n))
+        except OSError:
+            names = []
+        found = [n for n in names if target and n.startswith(target)]
+        lowered = target.strip().lower()
+        if len(found) != 1 and lowered and not self.HEXISH.match(lowered):
+            found = []
+            for n in names:
+                state = self._job_state(n) or {}
+                name = state.get("name") if isinstance(state.get("name"), str) else ""
+                if lowered in name.lower():
+                    found.append(n)
+        if len(found) == 1:
+            self.job = found[0]
+            self.log("claude attach %s: background job %s — following the transcript "
+                     "its own session names, and never guessing at one" % (target, self.job))
+            return self.job
+        if not self._said_unresolved:
+            self._said_unresolved = True
+            self.log("claude attach %s: %s in %s; following no transcript until one does"
+                     % (target, "no background job matches" if not found
+                        else "%d background jobs match" % len(found), self.jobs))
+        return None
+
+    def _job_state(self, job):
+        """`jobs/<job>/state.json` as a dict, or None. Written by the daemon
+        and by the session itself, whatever version either is: anything that
+        is not an object is no state."""
+        try:
+            with open(os.path.join(self.jobs, job, "state.json")) as fh:
+                state = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return state if isinstance(state, dict) else None
+
+    def _transcript_for(self, session_id, cwd, state):
+        """Where a background session's transcript is.
+
+        Not necessarily under our project directory: `attach` can be run
+        from anywhere, and the session writes under its own cwd (or its own
+        worktree's). Looked for in the order the daemon itself looks when it
+        resumes a job — the job's `linkScanPath` when it names this session,
+        that file's directory, then the project directory of the session's
+        cwd — and the first that exists wins. None existing yet (a session
+        just cleared, its first row not written) is the first of them.
+        """
+        name = session_id + ".jsonl"
+        where = []
+        scan = (state or {}).get("linkScanPath")
+        if isinstance(scan, str) and scan.endswith(".jsonl"):
+            where.append(scan if os.path.basename(scan) == name
+                         else os.path.join(os.path.dirname(scan), name))
+        for d in (cwd, (state or {}).get("cwd"), self.cwd):
+            if isinstance(d, str) and d:
+                where.append(os.path.join(project_dir(d, self.base), name))
+        for path in where:
+            if os.path.exists(path):
+                return path
+        return where[0] if where else None
 
 
 class CodexAgent:
@@ -2251,6 +2426,21 @@ def build_agent(name, argv=None):
     return ClaudeAgent()
 
 
+def claude_registry(pid, argv, cwd=None, log=None, config_dir=None):
+    """The `ClaudeSessionRegistry` a claude launched with `argv` is named by.
+
+    Three launches, three answers to "whose transcript is this terminal's"
+    (T33): an ordinary session is the child's own, by its pid; `claude attach
+    <id|name>` is the background job it names, by that job; the roster is
+    nobody's. An attach with no argument is still an attach — Claude Code
+    prints its usage and exits — and is named by nothing rather than by the
+    rules for a session it is not.
+    """
+    attach = (attach_target(argv) or "") if is_attach_launch(argv) else None
+    return ClaudeSessionRegistry(pid, cwd=cwd or os.getcwd(), config_dir=config_dir, log=log,
+                                 attach=attach, roster=is_roster_launch(argv))
+
+
 class TranscriptWatcher:
     """Follows every transcript in this project that grows after we start.
 
@@ -2275,8 +2465,10 @@ class TranscriptWatcher:
     Waiting costs a session that was going to idle through those seconds
     anyway; a guess, when it is wrong, folds the context of one session on
     the size of another's. Only when the grace runs out with no file of
-    ours — a claude that does not write one, `claude attach`, the roster —
-    does the heuristic get its turn, and says so in the log.
+    ours — a claude old enough not to write one — does the heuristic get its
+    turn, and says so in the log. `claude attach` and the roster never do
+    (T33): their registry says so (`may_guess`), and an attach is named by
+    the job on its command line instead, the roster by nobody.
     """
 
     IDENTITY_GRACE = 30.0    # CR_SESSION_GRACE_SEC; the longest wait on record is 13s
@@ -2405,6 +2597,8 @@ class TranscriptWatcher:
         """
         if self.guessing:
             return True
+        if not getattr(self.registry, "may_guess", True):
+            return False      # `claude attach`, the roster: never ours to guess (T33)
         if now < self.unnamed_until:
             return False
         self.guessing = True
@@ -2430,13 +2624,24 @@ class TranscriptWatcher:
         session_id = rec.get("sessionId")
         if not session_id or session_id == self.bound_session_id:
             return
-        self.bind(session_id, self.agent.path_for(session_id), why)
+        # A registry may say where the transcript is, not only whose it is:
+        # an attached background session writes under its own cwd (T33).
+        self.bind(session_id, rec.get("transcriptPath") or self.agent.path_for(session_id), why)
 
     def bind(self, session_id, path, why):
         old = self.bound_session_id
         self.bound_session_id = session_id
         self.current = path
-        self.offsets.setdefault(path, 0)
+        if path not in self.offsets:
+            # Everything in the directory we scan was seeded at start; a file
+            # outside it was not. The first one we are bound to there is a
+            # session older than us (an attach from another directory), and
+            # read from 0 it would replay its history — yesterday's limit
+            # banner included — as news. After that, a new file outside is a
+            # new session (`/clear`), and its first row is news.
+            outside = (os.path.normpath(os.path.dirname(path))
+                       != os.path.normpath(self.dir or ""))
+            self.offsets[path] = self._size(path) if old is None and outside else 0
         if old is None:
             self.log("session bound: %s (%s)" % (session_id, why))
         else:
@@ -2499,6 +2704,13 @@ class TranscriptWatcher:
             return os.path.getmtime(path)
         except OSError:
             return 0.0
+
+    @staticmethod
+    def _size(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -2723,6 +2935,14 @@ def claude_launch_args(cfg, agent, argv, pid=None):
         # `--settings` before it makes recent Claude Code builds treat `attach`
         # and its session id as a prompt instead, so retaining the command's
         # semantics is more important than observing its status line.
+        return []
+    if is_roster_launch(argv):
+        # The roster has no status line of its own to relay, and `agents`
+        # hands `--settings` on to "the agent view and dispatched sessions"
+        # (its own --help): every session started from it would run our proxy
+        # and report its model and window into this wrapper's status file as
+        # if they were ours — and go on doing so from the daemon, under this
+        # pid, long after we have exited (T33).
         return []
     raw_self = os.environ.get("CR_SELF") or ""
     self_path = os.path.realpath(raw_self) if raw_self else "agent-retrier"
@@ -3646,6 +3866,7 @@ class Controller:
         self._carry = ""          # overlap so a marker split across two reads still matches
         self._input_carry = b""   # an escape sequence cut in half by a read boundary
         self.last_draft_change = now if now is not None else time.time()
+        self.hands_off = None     # why nothing may be typed here at all (the roster, T33)
 
         # -- the context restart ---------------------------------------------- #
         # Reading the handoff file is the only I/O any of this needs, and it goes
@@ -4155,6 +4376,24 @@ class Controller:
             if self._alive_again(now) and self.on_alive(now, "output"):
                 return ("resume",)
             if now < self.wake_at:
+                return None
+            if self.hands_off:
+                # The wait was worth keeping — it is the account's, and the
+                # badge and the log say when it lifts — but nothing here is
+                # ours to type into. On the roster "continue" lands in the box
+                # that dispatches a NEW session, three times over by the time
+                # the retries give up; or in whichever session is open there,
+                # which was never identified (T33).
+                self.log("the %s is over; nothing typed: %s"
+                         % (self.incident or "wait", self.hands_off))
+                self.state = IDLE
+                self.attempts = 0
+                self.banner = None
+                self.banner_text = None
+                self.limit_source = None
+                self.rejected = set()
+                self.wake_at = 0.0
+                self.deferred = False
                 return None
             if self.attempts >= self.cfg["max_attempts"]:
                 self.log("giving up after %d attempts" % self.attempts)
@@ -6727,10 +6966,14 @@ def is_roster_launch(argv):
     included — past our scraper. Neither is this terminal's state, and both parse
     into a reset time that is not ours: a card reading "resets 2:10am" parked a
     wrapper for eleven hours while the limit it was actually under lifted in
-    seven minutes. There is no input box on the roster to type "continue" into
-    either, so the screen channel has nothing to offer here at all. The
-    transcript channel is untouched: a session we open from the roster and then
-    work in still reports its own limit through it.
+    seven minutes. The screen channel has nothing to offer here at all.
+
+    Nor has anything else that is a session's (T33). The roster has no
+    transcript, so none is followed and nothing is folded; whichever session
+    is opened on it was never identified; and its one input box dispatches a
+    NEW session with whatever is typed into it. A limit read off this
+    directory's transcripts is still the account's, waited out and shown —
+    and answered by typing nothing (`Controller.hands_off`).
 
     Read as the first positional word, so a prompt that happens to contain
     "agents" is not mistaken for the subcommand.
@@ -6749,6 +6992,23 @@ def is_attach_launch(argv):
             continue
         return arg == "attach"
     return False
+
+
+def attach_target(argv):
+    """The `<id|name>` of `claude attach <id|name>`, or None.
+
+    The word straight after `attach`, and only that: Claude Code takes
+    exactly one (a name with spaces arrives quoted, as one argument) and
+    refuses anything that starts with a dash there, so a flag in that place
+    is not a target either.
+    """
+    argv = list(argv or [])
+    if not is_attach_launch(argv):
+        return None
+    i = argv.index("attach")
+    if i + 1 < len(argv) and argv[i + 1] and not argv[i + 1].startswith("-"):
+        return argv[i + 1]
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -7055,8 +7315,14 @@ def main(argv):
         agents.enabled = False
         tree_screen = None
     usage_log = CodexUsageLog(CFG, log) if agent_name == "codex" and ctl.context_enabled else None
-    registry = (ClaudeSessionRegistry(pid, cwd=os.getcwd(), log=log)
-               if agent_name == "claude" else None)
+    registry = claude_registry(pid, argv, log=log) if agent_name == "claude" else None
+    if registry is not None and registry.roster:
+        # Not a session, and not ours: nothing on it is followed, so nothing
+        # can be folded, and a limit read off this directory's transcripts is
+        # waited out and shown but never answered by typing (T33).
+        ctl.hands_off = "this is the agent roster, not a session of ours"
+        log("the agent roster is no session of ours: no transcript is followed "
+            "and nothing is typed into it; limits are still read and shown")
     watcher = TranscriptWatcher(poll=CFG["poll"], agent=build_agent(agent_name, argv),
                                 echo=[CFG["message"], ctl.resume_text],
                                 registry=registry, log=log, grace=CFG["session_grace"])

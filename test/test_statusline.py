@@ -233,6 +233,15 @@ class TestClaudeLaunchArgsAddTheStatuslineProxy(unittest.TestCase):
         self.assertEqual(
             cr.claude_launch_args(self.cfg(), "claude", ["attach", "session-id"]), [])
 
+    def test_the_roster_relays_nobodys_status_line(self):
+        # T33. `claude agents` applies `--settings` to "the agent view and
+        # dispatched sessions": every session started from it would report
+        # its model and window into this wrapper's status file as ours, and
+        # go on doing so from the daemon, under this pid, after we exit.
+        for argv in (["agents"], ["--debug", "agents"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(cr.claude_launch_args(self.cfg(), "claude", argv), [])
+
     def test_the_path_is_named_after_the_given_pid(self):
         args = cr.claude_launch_args(self.cfg(), "claude", [], pid=999)
         payload = json.loads(args[1])

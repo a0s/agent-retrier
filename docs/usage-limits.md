@@ -50,7 +50,10 @@ read that way at all: started on `claude agents`, the wrapper switches the
 screen channel off for the run. Every card on that roster is a different
 session's last line, a limit shown there belongs to somebody else and is
 usually hours old, and opening a card scrolls that session's history — old
-banners included — past the same scraper. A wait the screen did schedule stays
+banners included — past the same scraper. A limit in one of the directory's
+transcripts is still read there and waited out, but nothing is typed into the
+roster when it lifts: its one input box starts a new session with whatever
+lands in it. A wait the screen did schedule stays
 open to it: a banner stating an earlier reset takes over, so a wrong one cannot
 hold the session past the moment it could have gone back to work.
 

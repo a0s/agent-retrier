@@ -2,6 +2,11 @@
 
 Priority: P0 · Epic: A · Depends on: T02, T04 · Size: M · Status: done (unreleased)
 
+> Amended by [T33](T33-attach-and-roster-identity.md): `claude attach` and the
+> roster no longer reach the heuristic below. An attach is named by the
+> background job on its command line, the roster by nothing, and neither is
+> ever guessed at.
+
 ## Problem
 
 T02 gave the wrapper claude's own answer to "which transcript is mine":
@@ -201,6 +206,7 @@ section (lock files, `lsof`) was never filled in.
 - **`claude attach` and the roster** still live on the heuristic, and it can
   still pick a neighbour's transcript and fold on it (one fresh candidate,
   ours being older than the wrapper). `attach <id>` names its session in argv.
+  → Done in [T33](T33-attach-and-roster-identity.md).
 - A codex **stall** is read from any rollout in the directory, like a limit,
   and nudges this terminal's session whoever was refused. Whether that is
   meant is not said anywhere.

@@ -302,6 +302,7 @@ class WrapperSession:
     def __init__(self, cwd, log, env):
         env = dict(env or {})
         agent = env.pop("agent", "claude")
+        args = list(env.pop("args", []))     # the agent's own arguments: `attach <id>`, `agents`
         self.agent = agent
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
@@ -321,7 +322,7 @@ class WrapperSession:
         full.update(env)
         self.log = log
         self.proc = subprocess.Popen(
-            [WRAP], stdin=slave, stdout=slave, stderr=slave,
+            [WRAP] + args, stdin=slave, stdout=slave, stderr=slave,
             env=full, cwd=cwd, close_fds=True, start_new_session=True)
         os.close(slave)
         self.buf = ""

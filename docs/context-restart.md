@@ -163,9 +163,31 @@ from. Three things pin down which one is this terminal's:
   transcript at all — there is no context count, no turn, and no answer that
   could end a wait, only limits, which are the account's and are read from
   any transcript. It waits `CR_SESSION_GRACE_SEC` (30 s) for the file. Only a
-  claude that never writes one — an older build, `claude attach`, the agent
-  roster — is followed by a heuristic after that; see [Caveats](#caveats) for
-  what the heuristic still gets wrong.
+  claude too old to write one is followed by a heuristic after that; see
+  [Caveats](#caveats) for what the heuristic still gets wrong.
+- **`claude attach <id|name>`** is not a session of the process the wrapper
+  started: it opens a *background* session, which runs in Claude Code's
+  daemon and writes `sessions/<pid>.json` under the daemon's pid, with
+  `kind: "bg"` and `jobId` naming its directory under `~/.claude/jobs/`. The
+  id (or name) on the command line resolves to that job the way Claude Code
+  resolves it, and the record naming the job is the session — through a
+  `/clear` too. A build whose record has no `jobId` is named by the job's own
+  `state.json` (`resumeSessionId`, `linkScanPath`), which the session keeps
+  current. Nothing else ever names an attach, and it is never guessed at:
+  its transcript is older than the wrapper, and the heuristic prefers a fresh
+  one — which in a shared directory is a neighbour's. The transcript may live
+  under another directory's project (the session's cwd, not the one you ran
+  `attach` from); it is read from where it is, from the moment it is found,
+  not replayed.
+- **`claude agents`, the roster**, is a list of other sessions with no
+  transcript of its own, and whichever session is opened on it was never
+  identified. No transcript is followed there — nothing is counted, nothing
+  is folded — and nothing is typed into it either: its one input box starts
+  a new session with whatever lands in it. A limit read off this directory's
+  transcripts is still waited out and shown (it is the account's); when it
+  lifts the log says `the limit is over; nothing typed`. The statusline proxy
+  is not added there either: `agents` hands `--settings` on to every session
+  dispatched from it.
 - **codex** has no such file to read (a rollout's head names no pid), so
   identity rests on the one thing nobody else can produce: the fold phrase's
   nonce (`HANDOFF-xxxxxxxx`), unique machine-wide. Its echo landing in a
@@ -608,8 +630,8 @@ Look in `~/.agent-retrier/log`. In order of likelihood:
   growing. It used to guess: bound for that moment to whichever session had
   started in the directory since it did, a wrapper started together with
   another read the other's context as its own.
-- Without that file at all (an older Claude Code, `claude attach`, the agent
-  roster, or two candidates the registry cannot tell apart), the watcher gives
+- Without that file at all (an older Claude Code, or two candidates the
+  registry cannot tell apart), the watcher gives
   it `CR_SESSION_GRACE_SEC` and then falls back to its previous heuristic:
   stay with the transcript already being followed while it grows, and
   otherwise prefer whichever one did not exist when the session started. That
@@ -618,6 +640,14 @@ Look in `~/.agent-retrier/log`. In order of likelihood:
   `no session registry for pid … after 30s; falling back to newest transcript`
   line in the log says when it is in effect. It is logged when the fallback
   begins, not at every launch.
+- `claude attach` and the roster never fall back to it. An attach whose job
+  cannot be resolved, or whose session nothing names, follows no transcript
+  — limits are still read — and says so once:
+  `claude attach X: no background job matches …`.
+- An attach follows the job on its command line, not what is on the screen.
+  `←` inside an attach returns to the agent view, where another session can
+  be opened; the wrapper goes on reading the job it was started with, and
+  anything it types goes to whatever the terminal is showing.
 
 ## Settings
 
