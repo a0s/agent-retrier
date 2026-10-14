@@ -1091,13 +1091,15 @@ def strip_ansi(text):
 #
 # The name is a tool's: letters, digits, "_", "-", the ":" of a plugin's agent.
 # That is also what keeps a real banner out of here whatever the renderer does
-# to its spacing — a gap is a cursor move as often as a space, and the move is
-# gone by the time we read the row — because both agents open theirs with
-# "You've", and no tool has an apostrophe in its name. Nor is any tool called
-# …Error: a row that opens with "APIError(" is a failure being reported, an
-# "API Error (…" with its gap dropped or an exception printed whole, and that
-# is the one kind of row this is here to read. An MCP tool goes by its display
-# name instead, "server - tool (MCP)(", spaces and a bracket of its own included.
+# to its spacing — a gap is a cursor move as often as a space, and whatever
+# reads the stream with its escapes dropped (`strip_ansi`) loses the move,
+# though the screen channel itself renders it (`ScreenChannel`) — because both
+# agents open theirs with "You've", and no tool has an apostrophe in its name.
+# Nor is any tool called …Error: a row that opens with "APIError(" is a failure
+# being reported, an "API Error (…" with its gap dropped or an exception
+# printed whole, and that is the one kind of row this is here to read. An MCP
+# tool goes by its display name instead, "server - tool (MCP)(", spaces and a
+# bracket of its own included.
 _CALL = (r"(?:(?![A-Za-z0-9_:-]*[Ee]rror\()[A-Za-z_][A-Za-z0-9_:-]{0,63}"
          r"|[^()]{1,120}\(MCP\))\(")
 _TOOL_HEADER = re.compile(r"^\s*[●⏺∙]\s*" + _CALL)
@@ -6267,6 +6269,68 @@ class Screen:
                 self._blank_row(r, 0, self.cols)
 
 
+class ScreenChannel:
+    """What the screen channel reads: the screen as it stands, not the stream.
+
+    Claude Code paints only the cells that changed, and to a renderer that
+    compares character and style, a blank cell already IS an unstyled space.
+    So in default-coloured text every gap between two words is a cell it
+    skips, with a cursor move: CHA (ESC[<col>G) along the row, CUF (ESC[<n>C)
+    to indent one, "\\r ESC[1B" down to the next. `strip_ansi` cannot place a
+    move, has to drop it, and glues the row: "⏺Explore(Findfirstfileincwd)",
+    all through the 2.1.273 captures in test/fixtures and the 2.1.283 one in
+    docs/demo/claude-restart.cast. Coloured text keeps its spaces — a dim or
+    tinted space is not a blank cell — and that is why each banner the
+    wrapper read off a 2.1.22x screen in August read whole while the tool row
+    above it did not: the banner is coloured. A banner in the default colour,
+    or a renderer that stops tinting it, would have been read as
+    "You'vehityoursessionlimit", which nothing here matches.
+
+    Turning the move into a space is not the cure. In those captures a fifth
+    to a third of the moves skip cells that are not blank, only unchanged: a
+    spinner's letters, a counter's digits, the head of a row whose tail
+    changed. Drop the move and the letters it skipped are lost ("2 background
+    agentlaunched" for "agents launched"); make it a space and a word is cut
+    in two. Nor does the stream keep rows apart the way the screen does: the
+    step over a blank row ("\\r ESC[2B") is one break like any other, so the
+    blank row is gone — and it is what ends a tool call's block
+    (`tool_echo_mask`) — while a banner painted over with spaces is gone from
+    the screen and still in the stream. Only a grid that remembers its cells
+    has any of this right, so the channel renders what claude draws into the
+    same `Screen` the overlay and the tests use, and reads the rows a person
+    would.
+
+    It holds the screen and nothing older: what scrolled away or was painted
+    over is not this session's state any more. Wide glyphs (CJK, most emoji)
+    take one cell here and two on the real terminal, so a row with one in it
+    can be read a cell off; no banner or refusal has one.
+    """
+
+    def __init__(self, rows, cols):
+        self.screen = Screen(rows, cols)
+
+    def feed(self, text):
+        self.screen.feed(text)
+
+    def forget(self):
+        """Whatever is drawn now is no longer news: read only what comes next.
+
+        ED 2 as though claude had sent it, so the cursor, the pen and the
+        scroll region stay where claude left them and the next frame — which
+        repaints only what changed — still lands in the right cells.
+        """
+        self.screen._erase_display(2)
+
+    def text(self):
+        return self.screen.text()
+
+    def limit(self):
+        return find_limit(self.screen.text())
+
+    def stall(self):
+        return find_stall(self.screen.text())
+
+
 _CHILD_GLYPH = "⎿"  # a child's own status line, not an agent of its own
 
 
@@ -7009,7 +7073,10 @@ def main(argv):
         scrape_allowed = False
         log("wrapping the agent roster; the screen channel is off "
             "(every banner on it belongs to another session)")
-    window = ""            # rolling, ansi-stripped view of what claude just drew
+    # The screen as claude has drawn it, rendered cell by cell (ScreenChannel
+    # says why the stream itself will not do). Built only for a run whose
+    # screen channel can decide, and let go the moment it no longer can.
+    screen_channel = ScreenChannel(rows, cols) if scrape_allowed else None
     esc_carry = ""         # half-received control sequence from the previous read
     pending = []           # [(due_ts, bytes)] scheduled writes into the pty
     pending_scrape = None  # (banner, confirm_at) — a scraped banner awaiting confirmation
@@ -7034,12 +7101,13 @@ def main(argv):
     def wait_cancelled():
         """The limit lifted on its own. Forget everything that described it.
 
-        The banner is still somewhere in the rolling window and in whatever the
+        The banner is still on the screen channel's grid and in whatever the
         scraper had half-confirmed; left there, it would be re-detected the
         moment the controller went idle and park the session all over again.
         """
-        nonlocal window, pending_scrape
-        window = ""
+        nonlocal pending_scrape
+        if screen_channel is not None:
+            screen_channel.forget()
         pending_scrape = None
         notify("session is answering again; wait cancelled")
 
@@ -7072,6 +7140,10 @@ def main(argv):
                 if tree_screen is not None:
                     tree_screen = Screen(rows, cols)
                     agents.painted = {}
+                if screen_channel is not None:
+                    # claude repaints the whole screen for the new size, so a
+                    # blank grid of that size is caught up within a frame.
+                    screen_channel = ScreenChannel(rows, cols)
 
             now = time.time()
             timeout = 0.25
@@ -7119,8 +7191,11 @@ def main(argv):
                             occupied.claim(badge.row(rows))
                         agents.paint(stdout_fd, rows, cols, tree_screen, agent_registry,
                                     occupied=occupied)
+                # The footer and the menu are read off the stream, escapes
+                # dropped: a "busy" signal must go stale the moment the footer
+                # stops being repainted, which a grid that keeps it on show
+                # would never let happen.
                 chunk = strip_ansi(text)
-                window = (window + chunk)[-8192:]
                 ctl.on_output(chunk, now)
                 # The transcript is the trustworthy channel; scraping the render is
                 # the fallback for when it is unavailable (no transcript directory,
@@ -7132,17 +7207,25 @@ def main(argv):
                 # one kind that can be somebody else's (see `rescrapable`). A
                 # stall is not re-read that way — there is nothing in it to
                 # correct, and one refusal must not read as an endless run.
-                rescrape = ctl.rescrapable()
-                if scrape_allowed and pending_scrape is None and (ctl.state == IDLE or rescrape):
+                if screen_channel is not None:
                     if CFG["scrape"] == "always" or not watcher.seen_any:
-                        banner = find_limit(window)
-                        if banner:
-                            pending_scrape = ("limit", banner, now + CFG["scrape_confirm"])
-                        elif not rescrape:
-                            stall = find_stall(window)
-                            if stall:
-                                pending_scrape = ("stall", stall,
-                                                  now + CFG["scrape_confirm"])
+                        screen_channel.feed(text)
+                    else:
+                        # `auto`, and the transcript has turned up: the screen
+                        # will not decide anything again this run (seen_any
+                        # never goes back), so it stops costing a render.
+                        screen_channel = None
+                rescrape = ctl.rescrapable()
+                if (screen_channel is not None and pending_scrape is None
+                        and (ctl.state == IDLE or rescrape)):
+                    banner = screen_channel.limit()
+                    if banner:
+                        pending_scrape = ("limit", banner, now + CFG["scrape_confirm"])
+                    elif not rescrape:
+                        stall = screen_channel.stall()
+                        if stall:
+                            pending_scrape = ("stall", stall,
+                                              now + CFG["scrape_confirm"])
 
             if watch_stdin and stdin_fd in ready:
                 try:
@@ -7272,17 +7355,18 @@ def main(argv):
             if pending_scrape and now >= pending_scrape[2]:
                 kind, text, _ = pending_scrape
                 pending_scrape = None
-                if CFG["scrape"] == "always" or not watcher.seen_any:
+                if screen_channel is not None and (CFG["scrape"] == "always"
+                                                   or not watcher.seen_any):
                     if kind == "stall":
                         if ctl.on_stall(text, now, "screen"):
                             # The line stays on screen after we have acted on it,
-                            # and on a TUI it is repainted for as long as it is
-                            # there. Forgetting the window is what keeps one
-                            # refusal from reading as an endless run of them.
-                            window = ""
+                            # for as long as nothing is drawn over it. Forgetting
+                            # what the grid holds is what keeps one refusal from
+                            # reading as an endless run of them.
+                            screen_channel.forget()
                             notify("the server refused the turn; trying again shortly")
                     elif ctl.on_limit(text, now, "screen"):
-                        window = ""
+                        screen_channel.forget()
                         notify("usage limit detected; waiting for reset")
 
             action = ctl.tick(now)

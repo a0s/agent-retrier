@@ -42,7 +42,10 @@ reason a turn ended and the size of the context window. Either is structured,
 unambiguous, and the one the wrapper trusts.
 
 The second is the screen, matched against patterns, and it is only used when
-the transcript is unavailable (`CR_SCRAPE` controls this). One command is never
+the transcript is unavailable (`CR_SCRAPE` controls this). It is read the way a
+terminal shows it, rendered cell by cell: Claude Code moves the cursor over a
+gap between words as often as it prints a space there.
+One command is never
 read that way at all: started on `claude agents`, the wrapper switches the
 screen channel off for the run. Every card on that roster is a different
 session's last line, a limit shown there belongs to somebody else and is

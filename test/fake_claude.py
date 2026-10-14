@@ -7,6 +7,9 @@ transcript, so the wrapper can be exercised end to end without burning real
 quota.
 
   FAKE_BANNER      text printed once at startup (the on-screen channel)
+  FAKE_BANNER_PAINT  1 = paint FAKE_BANNER the way Claude Code paints text in
+                   the default colour instead: no space ever written, every
+                   gap a cursor move (see `paint_like_claude`)
   FAKE_TRANSCRIPT  banner text written as a rate_limit record (the structured one)
   FAKE_DELAY       seconds to wait before doing either
   FAKE_EXIT        exit code to use when told to quit
@@ -305,6 +308,32 @@ def draw_agents_panel(out, state="running"):
     out.flush()
 
 
+def paint_like_claude(text):
+    """`text` as Claude Code >=2.1.22x draws default-coloured text on cells
+    that were blank.
+
+    Its renderer writes only the cells that differ from what is already on
+    screen, comparing character and style, and an unstyled space IS a blank
+    cell — so not one space is written. A word is reached with CHA
+    (ESC[<col>G), the next row with "\\r ESC[1B", all inside a synchronized-
+    update frame. That is the shape of every default-coloured row in
+    test/fixtures/*-2.1.273.bin and docs/demo/claude-restart.cast:
+    "⏺⎋[3GA⎋[5Gpty⎋[9G(pseudo-terminal)⎋[27Gis…". A row's first word, if it
+    starts in column 1, goes out with no move in front of it, as the real
+    ones do after their "\\r".
+
+    Rows are split on "\\r\\n". The cursor is left at the start of a fresh row
+    below, so whatever is printed next does not land on top of it.
+    """
+    out = ["\x1b[?2026h"]
+    for n, row in enumerate(text.split("\r\n")):
+        out.append("\r\x1b[1B" if n else "\r")
+        for m in re.finditer(r"\S+", row):
+            out.append(("\x1b[%dG" % (m.start() + 1) if m.start() else "") + m.group(0))
+    out.append("\x1b[?2026l\r\n")
+    return "".join(out)
+
+
 def maybe_run_statusline():
     """T20: if `--settings` (as `claude_launch_args` builds it) named a
     statusLine command, run it the way Claude Code itself would -- stdin fed
@@ -435,7 +464,10 @@ def main():
             write_transcript("a full-looking turn", limited=False,
                              tokens=int(os.environ["FAKE_USAGE"]), stop_reason="end_turn")
     if os.environ.get("FAKE_BANNER"):
-        out.write(os.environ["FAKE_BANNER"] + "\r\n")
+        if os.environ.get("FAKE_BANNER_PAINT") == "1":
+            out.write(paint_like_claude(os.environ["FAKE_BANNER"]))
+        else:
+            out.write(os.environ["FAKE_BANNER"] + "\r\n")
         out.flush()
 
     if os.environ.get("FAKE_WORKING"):

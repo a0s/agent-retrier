@@ -4,8 +4,11 @@ The positive cases include every banner wording recovered from real transcripts
 on this machine; the negative cases are the false positives that upstream
 claude-auto-retry shipped and then had to fix (issues #63, #15, #38, #19).
 """
+import os
+import re
 import unittest
 
+import fake_claude
 from helper import load
 
 cr = load()
@@ -360,10 +363,12 @@ class TestARealBannerIsNeverACall(unittest.TestCase):
                     self.assertIsNotNone(cr.find_limit(lead + text))
 
     def test_a_space_the_renderer_dropped_does_not_make_it_one(self):
-        # A gap is a cursor move as often as it is a space, and the move is
-        # gone by the time the row is read: "launched (↓ to manage)" arrives as
-        # "launched(↓ to manage)". A banner that lost the space in front of its
-        # bracket is still a banner.
+        # A gap is a cursor move as often as it is a space, and wherever the
+        # stream is read with its escapes dropped the move is gone: "launched
+        # (↓ to manage)" arrives as "launched(↓ to manage)". The screen channel
+        # renders the move back into a gap (TestTheScreenChannelReadsTheScreen)
+        # but find_limit is not only ever handed its grid. A banner that lost
+        # the space in front of its bracket is still a banner.
         for text in ["You've hit your session limit · resets 3pm(Europe/Warsaw)",
                      "5-hour limit reached(resets 3pm)",
                      "Usage limit reached(resets at 3pm)"]:
@@ -379,6 +384,131 @@ class TestARealBannerIsNeverACall(unittest.TestCase):
             with self.subTest(lead=lead):
                 self.assertEqual(cr.tool_echo_mask([lead + refusal]), [False])
                 self.assertIsNotNone(cr.find_stall(lead + refusal))
+
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def fixture(name):
+    with open(os.path.join(FIXTURES, name), "rb") as fh:
+        return fh.read().decode("utf-8", "replace")
+
+
+def rendered(paint, rows=50, cols=120):
+    ch = cr.ScreenChannel(rows, cols)
+    ch.feed(paint)
+    return ch
+
+
+def stripped(paint):
+    return [l.rstrip() for l in cr.strip_ansi(paint).split("\n")]
+
+
+# No real banner has ever been captured as bytes: the log keeps the text it
+# read, not the paint. So this is the banner as SCREEN_BANNERS has it, drawn
+# the way Claude Code draws default-coloured text (`paint_like_claude`). The
+# real one is coloured, and coloured text keeps its spaces — see the test
+# that says so below.
+BANNER_ROWS = ("  ⎿  You've hit your session limit · resets 3:40pm (Europe/Warsaw)\r\n"
+               "     /upgrade to increase your usage limit.")
+
+
+class TestTheScreenChannelReadsTheScreen(unittest.TestCase):
+    """Claude Code skips a cell that already shows what it wants, and to its
+    renderer a blank cell IS an unstyled space: every gap in default-coloured
+    text is a cursor move, not a space. Dropping the moves (`strip_ansi`) glues
+    the words; the screen channel renders them into a grid and reads that."""
+
+    def test_a_row_of_real_2_1_273_bytes(self):
+        raw = fixture("agent-tree-2.1.273.bin")
+        self.assertIn("Thatbackgroundmonitorstreamhasended—noactionneeded."
+                      "Stillwaitingonyou:whatwouldyouliketoworkon?", stripped(raw))
+        self.assertIn("⏺ That background monitor stream has ended — no action needed. "
+                      "Still waiting on you: what would you like to work on?",
+                      rendered(raw).text().split("\n"))
+
+    def test_the_letters_a_repaint_skips_are_kept(self):
+        # "1 background agent launched" became "2 … agents …": the repaint
+        # wrote what changed and stepped over the rest. A move is not always
+        # a gap — here it skips "launched"'s neighbours, which no reading of
+        # the stream alone can put back.
+        raw = fixture("agents-panel-2.1.273.bin")
+        self.assertIn("2 background agentlaunched (↓ to manage)", stripped(raw))
+        self.assertIn("⏺ 2 background agents launched (↓ to manage)",
+                      rendered(raw).text().split("\n"))
+
+    def test_a_tool_call_from_real_bytes_is_still_a_tool_call(self):
+        # "⏺⎋[3G⎋[1mExplore⎋[22m(Find⎋[16Gfirst⎋[22Gfile⎋[27Gin⎋[30Gcwd)", read
+        # up to the end of the frame that first draws it.
+        raw = fixture("agent-tree-2.1.273.bin")
+        end = raw.index("\x1b[?2026l", raw.index("\x1b[1mExplore\x1b[22m(Find"))
+        self.assertIn("⏺Explore(Findfirstfileincwd)", stripped(raw[:end]))
+        rows = rendered(raw[:end]).text().split("\n")
+        self.assertIn("⏺ Explore(Find first file in cwd)", rows)
+        self.assertTrue(cr.tool_echo_mask(rows)[rows.index("⏺ Explore(Find first file in cwd)")])
+
+    def test_a_banner_in_the_default_colour(self):
+        paint = fake_claude.paint_like_claude(BANNER_ROWS)
+        self.assertNotIn(" ", paint)
+        # What the screen channel used to read: nothing.
+        self.assertIsNone(cr.find_limit(cr.strip_ansi(paint)))
+        # What it reads now — the same line it logged off 2.1.22x in August.
+        self.assertEqual(rendered(paint).limit(),
+                         "/upgrade to increase your usage limit. ⎿  You've hit your "
+                         "session limit · resets 3:40pm (Europe/Warsaw)")
+
+    def test_a_banner_in_its_own_colour_was_always_read(self):
+        # Coloured text keeps its spaces, a move only where the colour starts:
+        # the shape of the amber "You've used 93% of your weekly limit ·
+        # resets …" warning in docs/demo/claude-restart.cast. The colours here
+        # are made up. This is why the August banners read whole.
+        paint = ("\r\x1b[1B\x1b[3G\x1b[38;2;153;153;153m⎿  \x1b[38;2;255;107;128m"
+                 "You've hit your session limit · resets 3:40pm (Europe/Warsaw)\x1b[39m"
+                 "\r\x1b[1B\x1b[6G\x1b[38;2;255;107;128m/upgrade to increase your usage "
+                 "limit.\x1b[39m")
+        self.assertIn("resets 3:40pm", cr.find_limit(paint))
+        self.assertIn("resets 3:40pm", rendered(paint).limit())
+
+    def test_a_refusal_in_the_default_colour(self):
+        paint = fake_claude.paint_like_claude(
+            "  ⎿  API Error: Selected model is at capacity. Please try a different model.")
+        self.assertIsNone(cr.find_stall(cr.strip_ansi(paint)))
+        self.assertEqual(rendered(paint).stall(), "⎿  API Error: Selected model is at "
+                         "capacity. Please try a different model.")
+
+    def test_a_banner_painted_over_is_gone(self):
+        # Erased the way the 2.1.273 captures erase a row: blanks written over
+        # each old word, the old gaps stepped over. The stream still has the
+        # banner in it; the screen does not.
+        row = "You've hit your session limit · resets 3pm (UTC)"
+        paint = "\r\x1b[1B\x1b[31m%s\x1b[39m\r" % row + "".join(
+            "\x1b[%dG%s" % (m.start() + 1, " " * len(m.group(0)))
+            for m in re.finditer(r"\S+", row))
+        self.assertIsNotNone(cr.find_limit(cr.strip_ansi(paint)))
+        self.assertIsNone(rendered(paint).limit())
+
+    def test_a_move_to_another_row_does_not_pair_the_two(self):
+        # Adjacent in the stream, 25 rows apart on the screen: a limit with no
+        # reset time and a reset time with no limit, not a banner.
+        paint = ("\x1b[5;3H\x1b[31mYou've hit your session limit\x1b[39m"
+                 "\x1b[30;3H\x1b[2m· resets 3pm (UTC)\x1b[22m")
+        self.assertIsNotNone(cr.find_limit(cr.strip_ansi(paint)))
+        self.assertIsNone(rendered(paint).limit())
+
+    def test_a_call_painted_like_claude_is_still_a_quotation(self):
+        paint = fake_claude.paint_like_claude("⏺ " + QUOTING + "\r\n  ⎿  1")
+        self.assertIn("⏺ " + QUOTING, rendered(paint).text().split("\n"))
+        self.assertIsNone(rendered(paint).limit())
+
+    def test_forgetting_keeps_the_cursor_where_claude_left_it(self):
+        # The next frame repaints only what changed, at positions claude
+        # computed from where its cursor is: blanking must not move it.
+        ch = rendered(fake_claude.paint_like_claude(BANNER_ROWS))
+        at = ch.screen.cursor()
+        ch.forget()
+        self.assertIsNone(ch.limit())
+        self.assertEqual(ch.text().strip(), "")
+        self.assertEqual(ch.screen.cursor(), at)
 
 
 if __name__ == "__main__":

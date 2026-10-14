@@ -409,6 +409,31 @@ class TestScrapeChannel(PtyTestCase):
         self.assertIn("limit detected (screen)", self.logged())
         self.assertIn("sending retry", self.logged())
 
+    def test_a_banner_painted_with_cursor_moves_triggers_a_retry(self):
+        # Not one space in the bytes: every gap a CHA, the way Claude Code
+        # paints default-coloured text on blank cells. Read with its escapes
+        # dropped it is "You'vehityoursessionlimit-resetsin1hours", and that
+        # is what the wrapper read until the screen channel kept a grid.
+        s = self.session(
+            env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours",
+                         FAKE_BANNER_PAINT="1"),
+            cwd=self.work)
+        self.assertTrue(s.read_until("GOT:continue", timeout=20), self.logged())
+        self.assertRegex(self.logged(), r"limit detected \(screen\), resets in \d+s: "
+                                        r"You've hit your session limit - resets in 1 hours")
+
+    def test_a_call_painted_with_cursor_moves_is_still_a_quotation(self):
+        # The same paint with its gaps put back is a tool call quoting a
+        # banner, and the gaps coming back must not make it a banner.
+        call = 'Bash(grep "hit your session limit - resets 3pm (UTC)" log)'
+        s = self.session(
+            env=self.env(FAKE_BANNER="⏺ " + call + "\r\n  ⎿  1", FAKE_BANNER_PAINT="1"),
+            cwd=self.work)
+        self.assertTrue(s.read_until("\x1b[?2026l"))
+        self.confirmed(s)
+        self.assertNotIn("limit detected", self.logged())
+        self.assertNotIn("GOT:continue", s.buf)
+
     def test_the_message_is_configurable(self):
         s = self.session(
             env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours",
