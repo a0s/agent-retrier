@@ -2838,8 +2838,9 @@ class TranscriptWatcher:
     `current` is whatever `sessions/<pid>.json` names, never a guess, and
     `_pick_current`'s growth heuristic never runs. Without one (codex, or an
     older claude with no pid file), the heuristic is all there is. Files
-    already present are seeded at their current size either way, so a
-    `--continue` run never replays yesterday's banner.
+    already present before the agent was started are seeded at their size
+    then either way (`sizes`), so a `--continue` run never replays
+    yesterday's banner.
 
     Between those two is the stretch every launch begins with (T32): there
     is a registry, and it has not named anyone yet. Claude Code writes its
@@ -2869,7 +2870,7 @@ class TranscriptWatcher:
     IDENTITY_GRACE = 30.0    # CR_SESSION_GRACE_SEC; the longest wait on record is 13s
 
     def __init__(self, directory=None, poll=2.0, now=None, echo=None, agent=None,
-                registry=None, log=None, grace=None):
+                registry=None, log=None, grace=None, seeded=None):
         # `directory` stays first and positional: it is how the claude side has
         # always been built, and naming a directory is still the whole of what
         # that side needs.
@@ -2894,15 +2895,22 @@ class TranscriptWatcher:
         self.grace = self.IDENTITY_GRACE if grace is None else grace
         self.unnamed_until = started + self.grace   # the registry's time to name us (T32)
         self.guessing = registry is None   # may `_pick_current` choose a transcript?
-        self._seed(started)
+        # `seeded`: `sizes()` taken before the agent was started (see main()).
+        self.offsets = dict(seeded) if seeded is not None else self.sizes(self.agent, started)
         self.preexisting = set(self.offsets)
 
-    def _seed(self, now):
-        for p in self.agent.paths(now):
+    @staticmethod
+    def sizes(agent, now=None):
+        """Every file `agent` scans, at the size it has now: what "already
+        there" means. Taken before the agent is started, not after — once it
+        runs, a row it writes ahead of this is history nobody ever reads."""
+        offsets = {}
+        for p in agent.paths(now if now is not None else time.time()):
             try:
-                self.offsets[p] = os.path.getsize(p)
+                offsets[p] = os.path.getsize(p)
             except OSError:
-                self.offsets[p] = 0
+                offsets[p] = 0
+        return offsets
 
     def expect(self, text):
         """Start watching for `text` as a verbatim echo of a submitted prompt.
@@ -7724,6 +7732,14 @@ def main(argv):
             "the restart threshold (T20; CR_STATUSLINE_PROXY=0 to disable)")
     extra = extra + statusline_args
 
+    # What is in the project before the agent exists, sized here and not where
+    # the watcher is built: after the fork the agent can run first, and a row
+    # it writes before we have looked is taken for history and never read — a
+    # limit written in its first moments, waited on by nobody (it took a
+    # loaded CI runner's scheduler to show it; the fakes write at once).
+    transcripts = build_agent(agent_name, argv)
+    seeded = TranscriptWatcher.sizes(transcripts)
+
     rows, cols = get_winsize(stdout_fd) if interactive else (24, 80)
     pid, master = fork_pty(rows, cols)
     if pid == 0:
@@ -7804,14 +7820,14 @@ def main(argv):
         ctl.hands_off = "this is the agent roster, not a session of ours"
         log("the agent roster is no session of ours: no transcript is followed "
             "and nothing is typed into it; limits are still read and shown")
-    transcripts = build_agent(agent_name, argv)
     if registry is None and agent_name == "codex":
         # codex's log names the thread our child runs, by its pid (T34).
         registry = CodexSessionRegistry(pid, transcripts, db=CFG["codex_logs_db"],
                                         started_at=session_start, log=log)
     watcher = TranscriptWatcher(poll=CFG["poll"], agent=transcripts,
                                 echo=[CFG["message"], ctl.resume_text],
-                                registry=registry, log=log, grace=CFG["session_grace"])
+                                registry=registry, log=log, grace=CFG["session_grace"],
+                                seeded=seeded)
     if ctl.context_enabled:
         agent_kind = "codex" if ctl.codex else "claude"
         override = ctl._model_tokens_override()

@@ -928,6 +928,36 @@ class TestTheUpdateNotice(PtyTestCase):
         self.assertIn("9.9.9", open(self.cache).read())
 
 
+# A wrapper whose CPU went elsewhere the moment it forked: the parent side of
+# its first `os.fork` waits until a file matching $HOLD_AFTER_FORK has bytes
+# in it (or 10s), then touches $HOLD_AFTER_FORK_DONE if it did.
+HOLD_AFTER_FORK = r'''
+import glob, os, time
+if os.environ.get("HOLD_AFTER_FORK"):
+    _fork = os.fork
+
+    def _has_bytes(p):
+        try:
+            return os.path.getsize(p) > 0
+        except OSError:
+            return False
+
+    def _held_fork():
+        pid = _fork()
+        if pid:
+            os.fork = _fork
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if any(_has_bytes(p) for p in glob.glob(os.environ["HOLD_AFTER_FORK"])):
+                    open(os.environ["HOLD_AFTER_FORK_DONE"], "w").close()
+                    break
+                time.sleep(0.01)
+        return pid
+
+    os.fork = _held_fork
+'''
+
+
 class TestTranscriptChannel(PtyTestCase):
     """The primary channel: nothing is scraped, the JSONL record drives it."""
 
@@ -980,6 +1010,34 @@ class TestTranscriptChannel(PtyTestCase):
         self.assertTrue(s.roundtrip())
         self.assertNotIn("sending retry", self.logged())
         self.assertNotIn("GOT:continue", s.buf)
+
+    def test_a_row_the_agent_writes_before_we_have_looked_is_read(self):
+        # After the fork either side may run first. On a loaded runner (macOS
+        # CI, run 38546542799) the fake got its limit row on disk before the
+        # wrapper sized the project, the row was taken for history, and
+        # nothing was ever detected. Held right after its fork until the row
+        # is there (HOLD_AFTER_FORK, a sitecustomize on PYTHONPATH), the
+        # wrapper reads it only if it sized the project before the fork.
+        hold = tempfile.mkdtemp(prefix="cr-hold-")
+        self.addCleanup(shutil.rmtree, hold, ignore_errors=True)
+        with open(os.path.join(hold, "sitecustomize.py"), "w") as fh:
+            fh.write(HOLD_AFTER_FORK)
+        held = os.path.join(hold, "held")
+        s = self.session(env={
+            "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_LOG": self.log,
+            "CR_SCRAPE": "never",
+            "CR_WAIT_SCALE": "3600",
+            "CR_MARGIN_SEC": "0",
+            "CR_POLL_SEC": "0.2",
+            "PYTHONPATH": hold,
+            "HOLD_AFTER_FORK": os.path.join(self.cfg, "projects", "*", "*.jsonl"),
+            "HOLD_AFTER_FORK_DONE": held,
+            "FAKE_TRANSCRIPT": "You've hit your weekly limit - resets in 40 hours",
+        }, cwd=self.work)
+        self.assertTrue(self.wait_log("limit detected (transcript)", s, timeout=15),
+                        self.logged())
+        self.assertTrue(os.path.exists(held))   # the race was really held open
 
     def test_a_live_transcript_turns_the_scraper_off(self):
         # Both channels active: the transcript is being written (so `seen_any`
