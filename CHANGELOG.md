@@ -41,6 +41,13 @@ below; the test suite checks it.
   counts: a banner that has scrolled away or been painted over no longer
   does.
 
+- A limit the agent writes in its first moments is no longer missed. The
+  wrapper sized the project's transcripts after starting the agent, so a row
+  written before that look was taken for old history and never read; the
+  sizes are now taken before the agent starts, and only what was there
+  before launch is skipped. A slow, loaded machine could lose the race; the
+  test suite did, on a CI runner.
+
 ### Added
 - `CR_GATE_RETRY_SEC` (5): how long a held restart step waits before it
   looks again. Unchanged by default; the test suite sets it short.
