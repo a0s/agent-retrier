@@ -151,8 +151,9 @@ would wait thirty seconds for a name it does not need).
 - **`claude attach`, the roster:** the heuristic after the wait, permanently.
   They no longer take a neighbour's session. `attach` names its session in
   argv and could be bound outright; not done here.
-- **codex:** has no registry, so none of this code runs for it. It has the
+- **codex:** had no registry, so none of this code ran for it. It had the
   same exposure by another route, and it is in the log — see "Left open".
+  Since T34 it has one, and the wait above is its wait too.
 
 ## Acceptance criteria
 
@@ -184,6 +185,11 @@ off than two claudes were, by the growth heuristic alone. Neither is changed
 here: both need something that names a codex session, and T03's "Checked"
 section (lock files, `lsof`) was never filled in.
 
+**Since done in [T34](T34-codex-session-named-by-its-log.md)** — codex's own
+log names the thread a process makes, by pid, before the thread has a
+rollout — for the two codex items and the stall below. `claude attach` and
+the roster are not part of it.
+
 - **The later wrapper reads the earlier one's rollout.** A rollout is created
   at the first message, so until its own session has spoken the neighbour's is
   the only candidate, and one candidate is not "ambiguous" (T03 holds the fold
@@ -209,7 +215,8 @@ section (lock files, `lsof`) was never filled in.
   → Done in [T33](T33-attach-and-roster-identity.md).
 - A codex **stall** is read from any rollout in the directory, like a limit,
   and nudges this terminal's session whoever was refused. Whether that is
-  meant is not said anywhere.
+  meant is not said anywhere. (T34: it was not; a refused turn is the
+  session's, and only our own rollout's is nudged now.)
 
 ## Not verified
 

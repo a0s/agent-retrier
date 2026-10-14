@@ -2139,6 +2139,57 @@ class ClaudeSessionRegistry:
         return where[0] if where else None
 
 
+# codex names a rollout for the moment its thread was created, and the thread
+# after that: rollout-2026-10-09T13-56-55-01a12086-017b-7b41-bb3e-82067d8ef304.jsonl
+_ROLLOUT_NAME = re.compile(
+    r"^rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(.+)\.jsonl$")
+
+
+def rollout_name(path):
+    """`(created, thread id)` as a rollout's file name states them, or `(None, None)`.
+
+    The name is chosen when the thread is CREATED -- as codex starts, or at a
+    `/clear` -- and the file is only made at the thread's first message: the
+    one above was born at 13:58:56, the two minutes its user took to type.
+    `created` prefers the thread id's own clock where it has one (UUIDv7, what
+    codex 0.16x mints: exact, and in UTC) to the name's local time, which is
+    to the second and an hour out for an hour a year.
+    """
+    m = _ROLLOUT_NAME.match(os.path.basename(path or ""))
+    if not m:
+        return None, None
+    thread = m.group(7)
+    created = thread_created_at(thread)
+    if created is None:
+        try:
+            created = time.mktime(tuple(int(x) for x in m.groups()[:6]) + (0, 0, -1))
+        except (OverflowError, ValueError):
+            created = None
+    return created, thread
+
+
+def thread_created_at(thread_id):
+    """When a UUIDv7 thread id says it was made (its first 48 bits are unix
+    milliseconds), or None for any other kind of id."""
+    hexed = (thread_id or "").replace("-", "")
+    if len(hexed) != 32 or hexed[12] != "7":
+        return None
+    try:
+        return int(hexed[:12], 16) / 1000.0
+    except ValueError:
+        return None
+
+
+def codex_resumes(argv):
+    """Was codex started to reopen a thread it already has (`codex resume`)?
+
+    Read loosely -- the word anywhere in its arguments -- because all it
+    decides is whether a rollout older than us may still be ours, and saying
+    yes for nothing only gives back the leniency every launch had before T34.
+    """
+    return "resume" in list(argv or [])
+
+
 class CodexAgent:
     """Where codex writes, and which of those files are this terminal's.
 
@@ -2153,6 +2204,10 @@ class CodexAgent:
     on, which the three-day scan can be long past by the time it happens
     (T03) — so `paths` also looks at the rest of the tree, for anything that
     has changed since we started.
+
+    Which of the files that pass all that is OUR session's is not a question
+    a rollout can answer on its own; `CodexSessionRegistry` answers it from
+    codex's log (T34), and asks this class where a thread's file is.
     """
 
     name = "codex"
@@ -2160,15 +2215,18 @@ class CodexAgent:
                                # can be months deep; walking all of it every poll
                                # would cost more than the feature is worth
 
-    def __init__(self, home=None, cwd=None, now=None):
+    def __init__(self, home=None, cwd=None, now=None, resuming=False):
         self.home = home or codex_home()
         self.dir = os.path.join(self.home, "sessions")
         self.cwd = os.path.realpath(cwd or os.getcwd())
         self.started_at = now if now is not None else time.time()
+        self.resuming = resuming     # `codex resume`: an old thread may be ours (T34)
         self._verdicts = {}          # path -> is this session's, once we can tell
         self._threads = {}           # path -> the thread id its head names
         self._old_paths = []         # last full-tree scan's answer (throttled)
         self._old_scan_at = 0.0
+        self._found = {}             # thread id -> its rollout, once there is one
+        self._hunted = {}            # thread id -> last whole-tree search for it
 
     def paths(self, now=None):
         now = now if now is not None else time.time()
@@ -2206,15 +2264,19 @@ class CodexAgent:
         return found
 
     def keep(self, path):
+        # Unknown means the head of the file has not landed yet. Reading it for
+        # one more poll is the cheap mistake; ignoring a session's own rollout
+        # for the rest of its life is not.
+        return self.verdict(path) is not False
+
+    def verdict(self, path):
+        """`_classify`'s answer, kept once it has one."""
         verdict = self._verdicts.get(path)
         if verdict is None:
             verdict = self._classify(path)
             if verdict is not None:
                 self._verdicts[path] = verdict
-        # Unknown means the head of the file has not landed yet. Reading it for
-        # one more poll is the cheap mistake; ignoring a session's own rollout
-        # for the rest of its life is not.
-        return verdict is not False
+        return verdict
 
     def _classify(self, path):
         """True: this terminal's. False: somebody else's. None: cannot tell yet."""
@@ -2263,6 +2325,81 @@ class CodexAgent:
             self._classify(path)
         return self._threads.get(path)
 
+    def thread_of(self, path):
+        """The same, from the file name first: a name is there before a head is."""
+        return rollout_name(path)[1] or self.thread_id(path)
+
+    def path_for(self, thread_id, now=None, scan=None):
+        """The rollout `thread_id` is written to, or None while it has none (T34).
+
+        A thread codex has only just created has no file yet, and will not
+        until it is first spoken to; asking again is the whole of the wait.
+        One `codex resume` reopened has had its file since the day it was
+        made, which is the day a UUIDv7 id names -- so that day is looked in,
+        and either side of it, before anything slower. An id that names no
+        day (an older codex) has the whole tree searched for it, at most once
+        every `OLD_SCAN_INTERVAL`; it would turn up in `_resumed_paths` by its
+        mtime soon enough anyway, once codex writes to it.
+        """
+        if not thread_id:
+            return None
+        found = self._found.get(thread_id)
+        if found and os.path.exists(found):
+            return found
+        now = now if now is not None else time.time()
+        if scan is None:
+            scan = self.paths(now)
+        elif not scan:
+            scan.extend(self.paths(now))     # the caller's, filled once for all its asks
+        tail = "-%s.jsonl" % thread_id
+        hits = [p for p in scan if p.endswith(tail)]
+        if not hits:
+            pattern = "rollout-*" + glob.escape(tail)
+            born = thread_created_at(thread_id)
+            if born is not None:
+                days = sorted({time.localtime(born + off)[:3] for off in (-86400, 0, 86400)})
+                for y, m, d in days:
+                    hits.extend(glob.glob(os.path.join(
+                        self.dir, "%04d" % y, "%02d" % m, "%02d" % d, pattern)))
+            elif now - self._hunted.get(thread_id, 0.0) >= self.OLD_SCAN_INTERVAL:
+                self._hunted[thread_id] = now
+                hits.extend(glob.glob(os.path.join(self.dir, "*", "*", "*", pattern)))
+        if not hits:
+            return None
+        self._found[thread_id] = sorted(hits)[0]
+        return self._found[thread_id]
+
+    def created_before_us(self, path):
+        """Was this rollout's thread made before this wrapper started?"""
+        created, _ = rollout_name(path)
+        # A second of slack: the name is to the second, and codex may well
+        # start inside the second we did.
+        return created is not None and created < int(self.started_at) - 1
+
+    def predates_us(self, path):
+        """A thread made before we started is not one the codex we forked has
+        made -- it makes its first as it starts, and the rest at each `/clear`
+        -- unless it was started to `codex resume` one (T34). In-session
+        `/resume` is the one way back to an old thread this cannot see; the
+        log can, which is why this is only ever the fallback's rule."""
+        return not self.resuming and self.created_before_us(path)
+
+    def seed_offset(self, path):
+        """Where to begin reading a rollout first seen after we started.
+
+        From its start, when its thread is newer than us: all of it is news.
+        From where it stands now, when the thread is older -- that is one
+        `codex resume` reopened, and the history in it (the limit it once
+        hit, the turns it closed days ago) was said to some earlier session,
+        not this one. It used to be read from byte 0 like a new file.
+        """
+        if not self.created_before_us(path):
+            return 0
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
 
 # --------------------------------------------------------------------------- #
 # codex's own count — the number its compaction is decided on
@@ -2287,6 +2424,13 @@ _USAGE_ROW = re.compile(
     r".*?\bauto_compact_scope_tokens=(?P<scope>\d+)"
     r".*?\bauto_compact_scope_limit=(?:Some\((?P<limit>\d+)\)|None)"
     r".*?\bfull_context_window_limit=(?:Some\((?P<full>\d+)\)|None)", re.S)
+
+
+def codex_logs_db(home):
+    """The newest `$CODEX_HOME/logs_*.sqlite`: the number moves when codex migrates it."""
+    found = sorted(glob.glob(os.path.join(home, "logs_*.sqlite")),
+                   key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
+    return found[-1] if found else None
 
 
 def parse_usage_row(body):
@@ -2324,11 +2468,7 @@ class CodexUsageLog:
         self.poll_every = cfg.get("poll", 2.0)
 
     def _db(self):
-        if self.path:
-            return self.path
-        found = sorted(glob.glob(os.path.join(self.home, "logs_*.sqlite")),
-                       key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
-        return found[-1] if found else None
+        return self.path or codex_logs_db(self.home)
 
     def _connect(self):
         if self.conn is not None:
@@ -2389,6 +2529,256 @@ class CodexUsageLog:
         return out
 
 
+# --------------------------------------------------------------------------- #
+# which codex thread is ours — codex's log says who wrote what (T34)
+# --------------------------------------------------------------------------- #
+# A rollout names no pid, and two codex sessions in one directory used to be
+# told apart by guesswork: the growth heuristic, and T03's hold "until the
+# handoff phrase proves which is ours". Both broke in the field (some_game,
+# 2026-10-08). A rollout does not exist until its thread is first spoken to, so
+# a wrapper whose session had said nothing yet found its neighbour's alone and
+# folded on it; and the neighbour, now seeing two, held its restart for a proof
+# that only a restart can produce, and never folded again.
+#
+# The log database codex already keeps for its compaction count (above) tags
+# every row with the process that wrote it and the thread it was about:
+#
+#   thread_id = 01a11dc8-abda-7612-aa7a-757c5b6d9551
+#   process_uuid = pid:93435:438fc725-e15d-43ed-a95d-8f3bb5a4a595
+#
+# and it writes such a row the moment a TUI creates a thread -- at launch and at
+# every /clear or /new, `rpc.method="thread/start"` -- not when the thread first
+# speaks: 01:10:53 for a thread whose rollout was born at 01:11:50, 11:57:21 for
+# one born at 12:54:50 (codex-cli 0.161.0, this machine's own logs). So the codex
+# we forked names its thread, by our child's pid, before there is any file to
+# guess at -- the same thing Claude Code's sessions/<pid>.json does for claude.
+class CodexSessionRegistry:
+    """Which thread the codex this wrapper forked is running, from codex's log.
+
+    Answers `lookup()` the way `ClaudeSessionRegistry` does -- `(record, why)`
+    or `(None, None)` -- except that the record carries the rollout's `path`,
+    and that path is None for a thread codex has made but not yet written to.
+    That is an answer, not a gap: it says every rollout in the directory is
+    somebody else's, which is what the wrapper later in a pair needed to hear.
+
+    Ours is a row whose `process_uuid` pid is our child or descends from it
+    (the cmux shim and npm's `codex.js` both put codex a generation or more
+    below what we fork). If more than one such process logs threads -- a
+    `codex exec` the session itself ran -- the shallowest is the session.
+    Its subagents log under the same pid; their rollouts' heads say so, and
+    they never count. Of its own threads, the newest one with a rollout is
+    the session, and a thread that has none yet only answers while there is
+    no such rollout at all: at launch, before anything has been said. A
+    `/clear` makes a thread at once and a file only at the resume phrase, so
+    until then the session stays where it was -- which is where the restart
+    waiting on that phrase needs it to stay.
+
+    Rows from before we started are not read, so a pid reused from a codex
+    that has since exited cannot pass for ours.
+
+    Two ways to have nothing to say. A log without `process_uuid` (an older
+    codex) can never name anyone: `unavailable`, and the watcher goes straight
+    to its heuristic, as it always did for codex. A log that names nobody for
+    our pid -- not yet, or not at all -- gets `TranscriptWatcher`'s ordinary
+    wait first. Either way `strangers()` keeps the heuristic off every rollout
+    the log does pin on another codex.
+    """
+
+    def __init__(self, child_pid, agent, db=None, started_at=None, log=None,
+                 proc_table=None):
+        self.child_pid = child_pid
+        self.agent = agent
+        self.path = db or None
+        self.started_at = time.time() if started_at is None else started_at
+        self.log = log or (lambda *_: None)
+        self.proc_table = proc_table or ClaudeSessionRegistry._ps_table
+        self.conn = None
+        self.unavailable = False   # the log cannot say which process wrote a row
+        self.last_id = None        # the newest row already read
+        self.procs = {}            # process_uuid -> how far below our child it runs, or None
+        self.by_proc = {}          # process_uuid -> {thread id: newest row id}, ours only
+        self.owner = None          # the process_uuid of the codex we forked
+        self.foreign = set()       # threads some other codex writes
+        self._servers = {}         # process_uuid -> is it codex's shared daemon
+        self._said = set()
+
+    def _say(self, line):
+        if line not in self._said:
+            self._said.add(line)
+            self.log(line)
+
+    def _connect(self):
+        if self.conn is not None:
+            return self.conn
+        path = self.path or codex_logs_db(self.agent.home)
+        if not path or not os.path.exists(path):
+            return None             # codex creates it as it starts; ask again
+        conn = None
+        try:
+            import sqlite3
+            conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=0.2,
+                                   check_same_thread=False)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(logs)")}
+        except Exception as exc:
+            # Locked mid-write is the usual one; asked again next poll.
+            self._say("cannot read codex's log database %s: %s" % (path, exc))
+            if conn is not None:
+                conn.close()
+            return None
+        if "process_uuid" in cols and "thread_id" in cols:
+            self.unavailable = False
+            self.conn = conn
+            return conn
+        conn.close()
+        if cols:
+            # Not "not yet": the table is there, and it was made by a codex
+            # that does not say who wrote a row. Looked at again every poll
+            # all the same -- a newer codex adds the column as it starts.
+            self.unavailable = True
+            self._say("codex's log database %s does not say which process wrote a row; "
+                      "falling back to newest transcript" % path)
+        return None
+
+    def _depth(self, proc, table):
+        """How far below our child the process behind `proc` runs: 0 for the
+        child itself, None for a process that is not ours."""
+        if proc in self.procs:
+            return self.procs[proc]
+        m = re.match(r"pid:(\d+):", proc or "")
+        depth = None
+        if m:
+            pid = int(m.group(1))
+            if pid == self.child_pid:
+                depth = 0
+            else:
+                if not table:
+                    table.update(self.proc_table())
+                seen, cur, hops = set(), table.get(pid), 1
+                while cur and cur not in seen:
+                    if cur == self.child_pid:
+                        depth = hops
+                        break
+                    seen.add(cur)
+                    cur, hops = table.get(cur), hops + 1
+        self.procs[proc] = depth
+        return depth
+
+    def _shared_server(self, proc):
+        """Is `proc` codex's shared app-server daemon? Every TUI on this
+        machine logged its threads in-process (`rpc.transport="in-process"`),
+        but one attached to the daemon would log them under the daemon's pid
+        -- ours among them. A thread it serves proves nothing either way, so
+        it is never counted against a rollout."""
+        if proc not in self._servers:
+            try:
+                with open(os.path.join(self.agent.home, "app-server-daemon",
+                                       "app-server.pid")) as fh:
+                    daemon = json.load(fh).get("pid")
+            except (OSError, ValueError, AttributeError):
+                daemon = None
+            self._servers[proc] = (isinstance(daemon, int)
+                                   and (proc or "").startswith("pid:%d:" % daemon))
+        return self._servers[proc]
+
+    def _refresh(self):
+        conn = self._connect()
+        if conn is None:
+            return
+        try:
+            if self.last_id is None:
+                # The first look goes by time, through codex's own index on
+                # it, and fixes where every later one starts by id.
+                top = conn.execute("SELECT MAX(id) FROM logs").fetchone()[0] or 0
+                rows = conn.execute(
+                    "SELECT MAX(id), process_uuid, thread_id FROM logs "
+                    "WHERE ts >= ? AND id <= ? GROUP BY process_uuid, thread_id",
+                    (int(self.started_at) - 2, top)).fetchall()
+                self.last_id = top
+            else:
+                rows = conn.execute(
+                    "SELECT MAX(id), process_uuid, thread_id FROM logs "
+                    "WHERE id > ? GROUP BY process_uuid, thread_id",
+                    (self.last_id,)).fetchall()
+        except Exception as exc:
+            # Locked mid-write, or migrated away: drop the handle and ask
+            # again next poll, as CodexUsageLog does.
+            self._say("codex's log database did not answer: %s" % exc)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self.conn = None
+            return
+        table = {}
+        for row_id, proc, thread in rows:
+            self.last_id = max(self.last_id, row_id or 0)
+            if not proc:
+                continue
+            depth = self._depth(proc, table)
+            if depth is None:
+                if thread and not self._shared_server(proc):
+                    self.foreign.add(thread)
+                continue
+            if self.owner is None or depth < self.procs[self.owner]:
+                self.owner = proc
+            if thread:
+                threads = self.by_proc.setdefault(proc, {})
+                threads[thread] = max(threads.get(thread, 0), row_id or 0)
+                self.foreign.discard(thread)    # a thread we have just reopened
+
+    def lookup(self):
+        """`(record, why)` for our session's thread, or `(None, None)`."""
+        self._refresh()
+        if self.owner is None:
+            return None, None
+        threads = self.by_proc.get(self.owner, {})
+        scan = []        # listed once a lookup, however many threads are unwritten
+        pending = None
+        for thread in sorted(threads, key=threads.get, reverse=True):
+            path = self.agent.path_for(thread, scan=scan)
+            if path is None:
+                pending = pending or thread
+                continue
+            verdict = self.agent.verdict(path)
+            if verdict is False:
+                continue                         # a subagent's, or another directory's
+            if verdict:
+                return {"sessionId": thread, "path": path}, self._why()
+            pending = pending or thread          # a head not yet written: next poll
+        if pending is None:
+            return None, None
+        return {"sessionId": pending, "path": None}, self._why() + "; no rollout yet"
+
+    def _why(self):
+        depth = self.procs.get(self.owner)
+        return ("pid %d in codex's log" % self.child_pid if depth == 0
+                else "descendant of pid %d in codex's log" % self.child_pid)
+
+    def strangers(self, paths):
+        """The rollouts among `paths` that are provably not this session's.
+
+        What the log pins on another codex, or on a codex the session itself
+        started (one is no more ours than the other); and, without asking the
+        log at all, a rollout whose thread was made before we started, unless
+        we were started to resume one (`CodexAgent.predates_us`). The growth
+        heuristic can still be all there is -- a log with nothing to say --
+        and this is what keeps it off the neighbours it used to settle on.
+        """
+        ours = self.by_proc.get(self.owner, {}) if self.owner else {}
+        nested = set()
+        for proc, threads in self.by_proc.items():
+            if proc != self.owner:
+                nested.update(threads)
+        out = set()
+        for p in paths:
+            thread = self.agent.thread_of(p)
+            if thread in ours:
+                continue
+            if thread in self.foreign or thread in nested or self.agent.predates_us(p):
+                out.add(p)
+        return out
+
+
 # codex takes the directory to work in on the command line, and when it is given
 # one the rollouts to follow are that directory's rather than ours.
 _CD_FLAGS = ("--cd", "--cwd", "-C")
@@ -2422,7 +2812,7 @@ def pick_agent(name, launch):
 
 def build_agent(name, argv=None):
     if name == "codex":
-        return CodexAgent(cwd=codex_cwd(argv))
+        return CodexAgent(cwd=codex_cwd(argv), resuming=codex_resumes(argv))
     return ClaudeAgent()
 
 
@@ -2469,6 +2859,11 @@ class TranscriptWatcher:
     turn, and says so in the log. `claude attach` and the roster never do
     (T33): their registry says so (`may_guess`), and an attach is named by
     the job on its command line instead, the roster by nobody.
+
+    codex has a registry too since T34 (`CodexSessionRegistry`, codex's own
+    log), with two differences the code below allows for: it can name a
+    thread that has no rollout yet, which binds with `current` still None;
+    and it can say it will never name anyone, which skips the wait.
     """
 
     IDENTITY_GRACE = 30.0    # CR_SESSION_GRACE_SEC; the longest wait on record is 13s
@@ -2553,7 +2948,7 @@ class TranscriptWatcher:
         for p in kept:
             start = self.offsets.get(p)
             if start is None:
-                start = 0                       # created after we started: read it all
+                start = self._first_offset(p)   # created after we started: read it all
             try:
                 size = os.path.getsize(p)
             except OSError:
@@ -2599,6 +2994,11 @@ class TranscriptWatcher:
             return True
         if not getattr(self.registry, "may_guess", True):
             return False      # `claude attach`, the roster: never ours to guess (T33)
+        if getattr(self.registry, "unavailable", False):
+            # It has said it will never name anyone (codex's log from a codex
+            # that does not record who wrote a row, T34): nothing to wait for.
+            self.guessing = True
+            return True
         if now < self.unnamed_until:
             return False
         self.guessing = True
@@ -2615,6 +3015,13 @@ class TranscriptWatcher:
         idle.
         """
         rec, why = self.registry.lookup()
+        strangers = getattr(self.registry, "strangers", None)
+        if strangers is not None:
+            # Rollouts the registry can pin on somebody else (codex, T34): the
+            # heuristic, if it ever gets a turn, must not settle on one, and
+            # none of them is a second candidate for T03 to hold a fold over.
+            self._demoted |= strangers([p for p in self.offsets if p not in self._demoted])
+            self.candidates = [p for p in self.candidates if p not in self._demoted]
         if rec is None:
             self.agent_status = None
             return
@@ -2622,26 +3029,47 @@ class TranscriptWatcher:
         updated = rec.get("statusUpdatedAt")
         self.agent_status_at = updated / 1000.0 if isinstance(updated, (int, float)) else now
         session_id = rec.get("sessionId")
-        if not session_id or session_id == self.bound_session_id:
+        if not session_id:
             return
-        # A registry may say where the transcript is, not only whose it is:
-        # an attached background session writes under its own cwd (T33).
-        self.bind(session_id, rec.get("transcriptPath") or self.agent.path_for(session_id), why)
+        if session_id == self.bound_session_id and ("path" not in rec
+                                                    or rec["path"] == self.current):
+            return
+        # A codex record says where its thread is written, None included: it
+        # is named before it has a rollout (T34). A claude record may say
+        # where its transcript is, not only whose it is: an attached
+        # background session writes under its own cwd (T33).
+        if "path" in rec:
+            path = rec["path"]
+        else:
+            path = rec.get("transcriptPath") or self.agent.path_for(session_id)
+        self.bind(session_id, path, why)
+
+    def _first_offset(self, path):
+        """Where reading a file first seen after we started begins: its first
+        byte, unless the agent says it holds history (`CodexAgent.seed_offset`)."""
+        seed = getattr(self.agent, "seed_offset", None)
+        return seed(path) if seed is not None else 0
 
     def bind(self, session_id, path, why):
         old = self.bound_session_id
         self.bound_session_id = session_id
         self.current = path
-        if path not in self.offsets:
-            # Everything in the directory we scan was seeded at start; a file
-            # outside it was not. The first one we are bound to there is a
-            # session older than us (an attach from another directory), and
-            # read from 0 it would replay its history — yesterday's limit
-            # banner included — as news. After that, a new file outside is a
-            # new session (`/clear`), and its first row is news.
-            outside = (os.path.normpath(os.path.dirname(path))
-                       != os.path.normpath(self.dir or ""))
-            self.offsets[path] = self._size(path) if old is None and outside else 0
+        if path is not None and path not in self.offsets:
+            if getattr(self.agent, "seed_offset", None) is not None:
+                self.offsets[path] = self._first_offset(path)
+            else:
+                # Everything in the directory we scan was seeded at start; a
+                # file outside it was not. The first one we are bound to there
+                # is a session older than us (an attach from another
+                # directory), and read from 0 it would replay its history —
+                # yesterday's limit banner included — as news. After that, a
+                # new file outside is a new session (`/clear`), and its first
+                # row is news.
+                outside = (os.path.normpath(os.path.dirname(path))
+                           != os.path.normpath(self.dir or ""))
+                self.offsets[path] = self._size(path) if old is None and outside else 0
+        if old == session_id:
+            return            # the thread we were told of has written its rollout (codex)
         if old is None:
             self.log("session bound: %s (%s)" % (session_id, why))
         else:
@@ -3903,6 +4331,9 @@ class Controller:
         self.context_path = None      # the transcript those figures came from
         self.context_guessed = False  # ...picked by the growth heuristic, not named (T32)
         self.context_ambiguous = False   # >1 unconfirmed candidate rollout (T03)
+        self._proof_wait_since = None    # ...holding a fold back since (T34)
+        self._fold_unproven = False      # the hold has given way to that reading
+        self._unproven_path = None       # ...and the rollout a fold then went out on
         self.context_grew_at = 0.0    # ...and when it last gained a byte
         self.context_off = False      # a failure bad enough not to repeat
         self.last_stop_reason = None  # how the turn we are waiting on ended
@@ -4646,10 +5077,16 @@ class Controller:
         is, and the guess is the whole reason this exists. What it gates is
         the one thing a wrong guess cannot be allowed to do: fold a session
         that was never actually near its limit because a neighbour's was.
+
+        Since T34 this is the fallback's alone: codex's log names our thread
+        whenever it records who wrote a row, and a named thread is never
+        ambiguous. And the hold is no longer for good (`PROOF_WAIT`).
         """
         if ambiguous == self.context_ambiguous:
             return
         self.context_ambiguous = ambiguous
+        self._proof_wait_since = None
+        self._fold_unproven = False    # a fold already out keeps `_unproven_path`
         if ambiguous:
             self.log("more than one candidate rollout in this directory; "
                      "holding the restart until the handoff phrase proves which is ours")
@@ -5095,8 +5532,20 @@ class Controller:
             return False
         self.log("the handoff phrase was accepted")
         self.handoff_echoed = True
+        # Against the rollout the fold was decided on, not `context_path`: the
+        # echo's own growth can have handed the heuristic back our rollout a
+        # moment before this, in the same poll.
+        folded_on, self._unproven_path = self._unproven_path, None
+        self._fold_unproven = False
         if path and path != self.context_path:
             self.bind_transcript(path, "our handoff phrase was echoed there", now)
+        if folded_on and path and path != folded_on:
+            # The fold T03's hold let through on a guess, and the guess was
+            # wrong: the count it went out on was a neighbour's. The phrase is
+            # in our session now, so it is called off in words (T09); the next
+            # fold is decided on our own count, proven at last.
+            self._abort_restart("the handoff phrase landed in another rollout than "
+                                "the one whose count it was folded on", now)
         return True
 
     def on_handoff_queued(self, now):
@@ -5425,20 +5874,48 @@ class Controller:
         self._restart_times = [t for t in self._restart_times if t > cutoff]
         return len(self._restart_times) >= cap
 
+    # How long T03's hold may keep a fold back (T34). It waited for the
+    # handoff phrase's echo to prove which rollout is ours, and only a restart
+    # types that phrase: a wrapper whose reading stayed ambiguous never folded
+    # again (some_game, 2026-10-08: held from 19:55:42, and the next thing it
+    # had to say was that codex had compacted the thread itself at the cap).
+    # Past this, the fold goes out on the reading anyway, between turns only,
+    # and the echo settles it: where it lands is ours, and a phrase that lands
+    # anywhere but the rollout whose count it was folded on is called off.
+    PROOF_WAIT = 300.0
+
+    def _proof_waited_out(self, now):
+        """Has an ambiguous reading held a fold back for `PROOF_WAIT`?"""
+        if self._proof_wait_since is None:
+            self._proof_wait_since = now
+        if now - self._proof_wait_since < self.PROOF_WAIT:
+            return False
+        if not self._fold_unproven:
+            self.log("the restart has been held %.0fs for want of a proof of which rollout "
+                     "is ours; folding on this one anyway — the phrase's echo will say"
+                     % (now - self._proof_wait_since))
+        self._fold_unproven = True
+        return True
+
     def _maybe_restart(self, now):
         limit = self.trigger_limit() if self.context_enabled else None
         if limit is None:
             return None
         if self.context_tokens is None or self.context_tokens < limit:
+            self._proof_wait_since = None
+            self._fold_unproven = False
             return None
-        if self.context_ambiguous:
+        if self.context_ambiguous and not self._proof_waited_out(now):
             return None
         if now < self.cooldown_until:
             return None
         cap = self.cfg["context_max_cycles"]
         if cap and self.cycles >= cap:
             return None
-        interrupt = self._maybe_interrupt(now)
+        # Esc in the middle of a turn is not something to do to a session on
+        # a count that may be a neighbour's: an unproven fold waits for the
+        # turn to end like any other below the interrupt line.
+        interrupt = None if self._fold_unproven else self._maybe_interrupt(now)
         if interrupt:
             return interrupt
         if self._held(now):
@@ -5457,6 +5934,7 @@ class Controller:
         # the last row said by then — and a project directory can hold more than
         # one live transcript, so "by then" is not always this session.
         self.context_before = self.context_tokens
+        self._unproven_path = self.context_path if self._fold_unproven else None
         self.log("context is %s of a %s window (%.0f%%, threshold %s); folding up"
                  % (human_tokens(self.context_tokens), human_tokens(self.context_window),
                     self.context_pct() or 0.0, human_tokens(limit)))
@@ -5851,6 +6329,9 @@ class Controller:
         self._gate_note = None
         self._cancel_sent = False
         self._cleared_by_hand = False
+        self._fold_unproven = False
+        self._unproven_path = None
+        self._proof_wait_since = None
         self.cooldown_until = now + self.cfg["context_cooldown"]
 
     def _abort_restart(self, why, now, permanent=False):
@@ -7323,7 +7804,12 @@ def main(argv):
         ctl.hands_off = "this is the agent roster, not a session of ours"
         log("the agent roster is no session of ours: no transcript is followed "
             "and nothing is typed into it; limits are still read and shown")
-    watcher = TranscriptWatcher(poll=CFG["poll"], agent=build_agent(agent_name, argv),
+    transcripts = build_agent(agent_name, argv)
+    if registry is None and agent_name == "codex":
+        # codex's log names the thread our child runs, by its pid (T34).
+        registry = CodexSessionRegistry(pid, transcripts, db=CFG["codex_logs_db"],
+                                        started_at=session_start, log=log)
+    watcher = TranscriptWatcher(poll=CFG["poll"], agent=transcripts,
                                 echo=[CFG["message"], ctl.resume_text],
                                 registry=registry, log=log, grace=CFG["session_grace"])
     if ctl.context_enabled:
@@ -7593,6 +8079,13 @@ def main(argv):
                 if rec.get("turn") and rec.get("path") == watcher.current:
                     ctl.on_turn(rec["turn"], now)     # a turn that died of it
                 if rec.get("kind") == "stall":
+                    # Unlike a limit, a refused turn is a session's, not the
+                    # account's: the neighbour it happened to has its own
+                    # wrapper, or its own person, to type `continue` into it.
+                    # Ours never stopped, and a nudge would start a turn in
+                    # it that nobody asked for (T34). Only codex writes these.
+                    if rec.get("path") != watcher.current:
+                        continue
                     pending_scrape = None        # the structured channel wins
                     if ctl.on_stall(rec["text"], now, "transcript"):
                         notify("the server refused the turn; trying again shortly")

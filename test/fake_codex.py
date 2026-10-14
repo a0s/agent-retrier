@@ -16,7 +16,10 @@ wrapper can be exercised end to end without burning real quota.
   FAKE_WORKING     print codex's own streaming footer forever (session looks busy)
 
 Typing `answer` writes an ordinary (non-error) task_complete: a turn that was
-served, which is how a session says its quota came back.
+served, which is how a session says its quota came back. `usage N` serves a
+turn that leaves N tokens in the context, and `refuse` a turn the server
+refused (FAKE_STALL's wording, or codex's capacity line) — on cue, for the
+tests that need a session to change only once its neighbour is watching.
 
 It also plays the other half of a context restart, which needs a session that
 answers with numbers rather than words:
@@ -43,6 +46,20 @@ answers with numbers rather than words:
   FAKE_COMPACT       when set, `compact` writes a `compacted` row: codex compacting
                      the thread on its own
 
+Who wrote what (T34). Like codex-cli 0.161, the fake logs a row into
+$CODEX_HOME/logs_2.sqlite the moment it creates a thread — at startup and at
+every `/clear` — tagged `process_uuid = pid:<its pid>:<uuid>`, which is how the
+wrapper tells its own codex's thread from a neighbour's. Thread ids are
+UUIDv7, as codex's are.
+
+  FAKE_LOG_PID       "0": an older codex — the log table has no process_uuid
+                     column and no thread is ever named in it (default "1")
+  FAKE_LAZY_ROLLOUT  when set, a thread's rollout file is not made until
+                     something is first written to it — real codex makes it at
+                     the thread's first message, not when the thread is
+                     created. Without it the file is made at once, as the
+                     fake always has (the startup records above need it).
+
 A turn it serves is framed the way codex-cli 0.154 frames one: task_started
 (carrying the window), turn_context (carrying the model), the turn's rows, and
 task_complete or turn_aborted.
@@ -66,6 +83,8 @@ _TARGET = re.compile(r"handoff to `([^`]+)`")
 SESSION = [None]   # [current rollout file path]
 THREAD = [None]    # [current thread id]
 ORDINAL = [0]      # resets to 0 whenever a new rollout file is started
+PENDING = [None]   # [(path, session_meta, ts)] of a thread whose file is not made yet
+PROCESS = "pid:%d:%s" % (os.getpid(), uuid.uuid4())   # codex's process_uuid
 
 
 def codex_home():
@@ -80,7 +99,63 @@ def window():
     return int(os.environ.get("FAKE_WINDOW", "258400"))
 
 
+def uuid7(at=None):
+    """A UUIDv7, the kind codex mints: 48 bits of unix milliseconds first."""
+    ms = int((time.time() if at is None else at) * 1000) & ((1 << 48) - 1)
+    rand = int.from_bytes(os.urandom(10), "big")
+    n = ((ms << 80) | (0x7 << 76) | (((rand >> 62) & 0xFFF) << 64)
+         | (0x2 << 62) | (rand & ((1 << 62) - 1)))
+    return str(uuid.UUID(int=n))
+
+
+def logs_db():
+    """$CODEX_HOME/logs_2.sqlite, laid out the way codex-cli 0.161 lays it out
+    (or, with FAKE_LOG_PID=0, the way a codex from before process_uuid did)."""
+    import sqlite3
+    db = sqlite3.connect(os.path.join(codex_home(), "logs_2.sqlite"), timeout=10)
+    db.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "ts INTEGER NOT NULL, ts_nanos INTEGER NOT NULL, level TEXT NOT NULL, "
+               "target TEXT NOT NULL, feedback_log_body TEXT, thread_id TEXT, %s"
+               "estimated_bytes INTEGER NOT NULL DEFAULT 0)"
+               % ("process_uuid TEXT, " if names_its_process() else ""))
+    return db
+
+
+def names_its_process():
+    return os.environ.get("FAKE_LOG_PID", "1") != "0"
+
+
+def write_log(body, thread, level="TRACE", target="codex_core"):
+    db = logs_db()
+    if names_its_process():
+        db.execute("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, "
+                   "process_uuid) VALUES (?, 0, ?, ?, ?, ?, ?)",
+                   (int(time.time()), level, target, body, thread, PROCESS))
+    else:
+        db.execute("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) "
+                   "VALUES (?, 0, ?, ?, ?, ?)", (int(time.time()), level, target, body, thread))
+    db.commit()
+    db.close()
+
+
+def log_thread_start(thread):
+    """The row codex logs the moment a TUI makes a thread, long before its
+    rollout exists (copied in shape from a real logs_2.sqlite, codex 0.161)."""
+    if not names_its_process():
+        logs_db().close()        # the table is still there, as an older codex left it
+        return
+    write_log('app_server.request{otel.kind="server" otel.name="thread/start" '
+              'rpc.system="jsonrpc" rpc.method="thread/start" rpc.transport="in-process"}: '
+              'shell snapshot captured', thread, level="INFO", target="codex_core::shell_snapshot")
+
+
 def write_record(rtype, payload, ts=None):
+    if SESSION[0] is None and PENDING[0] is not None:
+        # The thread's first message: codex makes its rollout now.
+        path, meta, meta_ts = PENDING[0]
+        PENDING[0] = None
+        SESSION[0] = path
+        write_record("session_meta", meta, ts=meta_ts)
     rec = {"timestamp": ts or now_iso(), "ordinal": ORDINAL[0], "type": rtype, "payload": payload}
     ORDINAL[0] += 1
     with open(SESSION[0], "a") as fh:
@@ -100,8 +175,9 @@ def new_rollout(age_days=0):
     d = os.path.join(codex_home(), "sessions",
                       time.strftime("%Y", now), time.strftime("%m", now), time.strftime("%d", now))
     os.makedirs(d, exist_ok=True)
-    sid = str(uuid.uuid4())
+    sid = uuid7(time.time() - age_days * 86400)
     THREAD[0] = sid
+    log_thread_start(sid)
     name = "rollout-%s-%s.jsonl" % (time.strftime("%Y-%m-%dT%H-%M-%S", now), sid)
     SESSION[0] = os.path.join(d, name)
     ORDINAL[0] = 0
@@ -119,6 +195,10 @@ def new_rollout(age_days=0):
         "thread_source": "subagent" if subagent else "user",
         "model_provider": "openai",
     }
+    if os.environ.get("FAKE_LAZY_ROLLOUT"):
+        PENDING[0] = (SESSION[0], payload, ts)
+        SESSION[0] = None
+        return
     write_record("session_meta", payload, ts=ts)
 
 
@@ -144,7 +224,6 @@ def write_assistant_message(text):
 
 def write_usage_log(tokens):
     """One row of codex's own accounting, in its log database."""
-    import sqlite3
     total = int(tokens) + int(os.environ.get("FAKE_LOG_EXTRA", "18000"))
     full = window()
     if "body_after_prefix" in " ".join(sys.argv[1:]):
@@ -157,15 +236,7 @@ def write_usage_log(tokens):
             "full_context_window_limit=Some(%d) full_context_window_limit_reached=false "
             "token_limit_reached=false model_needs_follow_up=false"
             % (THREAD[0], total, scope, limit, scope_name, full))
-    db = sqlite3.connect(os.path.join(codex_home(), "logs_2.sqlite"))
-    db.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-               "ts INTEGER NOT NULL, ts_nanos INTEGER NOT NULL, level TEXT NOT NULL, "
-               "target TEXT NOT NULL, feedback_log_body TEXT, thread_id TEXT, "
-               "estimated_bytes INTEGER NOT NULL DEFAULT 0)")
-    db.execute("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) "
-               "VALUES (?, 0, 'TRACE', 'codex_core', ?, ?)", (int(time.time()), body, THREAD[0]))
-    db.commit()
-    db.close()
+    write_log(body, THREAD[0])
 
 
 def write_token_count(tokens):
@@ -344,6 +415,25 @@ def main():
             write_token_count(100)
             write_task_complete("an ordinary answer")
             out.write("GOT:answer\r\n")
+            out.flush()
+            continue
+        m = re.match(r"usage (\d+)$", line)
+        if m:
+            write_task_started()
+            write_assistant_message("an answer")
+            write_token_count(m.group(1))
+            write_task_complete("an answer")
+            out.write("GOT:%s\r\n" % line)
+            out.flush()
+            continue
+        if line == "refuse":
+            write_task_started()
+            write_task_complete(None, error={
+                "message": os.environ.get("FAKE_STALL") or
+                "Selected model is at capacity. Please try a different model.",
+                "codex_error_info": os.environ.get("FAKE_STALL_INFO", "server_overloaded"),
+            })
+            out.write("GOT:refuse\r\n")
             out.flush()
             continue
         if line == "compact" and os.environ.get("FAKE_COMPACT"):

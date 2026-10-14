@@ -286,7 +286,7 @@ these were written for; reach for them when something specific is wrong.
 | variable | default | applies to | |
 |---|---|---|---|
 | `CR_POLL_SEC` | `2` | both | how often the transcript (and claude's statusline file) is re-read |
-| `CR_SESSION_GRACE_SEC` | `30` | claude | how long claude is given to write `~/.claude/sessions/<pid>.json` before the wrapper concludes it never will and falls back to guessing which transcript is its own; until then it follows none. Not used by `claude attach` (named by its job) or `claude agents` (named by nothing), which never guess — see [which session is mine](context-restart.md#which-session-is-mine) |
+| `CR_SESSION_GRACE_SEC` | `30` | both | how long claude is given to write `~/.claude/sessions/<pid>.json` (codex: to name a thread for our pid in its log) before the wrapper concludes it never will and falls back to guessing which transcript is its own; until then it follows none. Not used by `claude attach` (named by its job) or `claude agents` (named by nothing), which never guess — see [which session is mine](context-restart.md#which-session-is-mine) |
 | `CR_BUSY_IDLE_SEC` | `6` | both | no "working" footer for this long means the session is idle |
 | `CR_VERIFY_SEC` | `60` | both | how long to watch that a typed retry actually took hold |
 | `CR_SCRAPE_CONFIRM_SEC` | `3` | both | a limit banner read off the screen must persist this long to count |

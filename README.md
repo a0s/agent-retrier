@@ -161,7 +161,7 @@ pretending they are the same:
 |---|---|---|
 | wrapper name | `agent-retrier-claude` / `agent-retrier --claude` | `agent-retrier-codex` / `agent-retrier --codex` |
 | command setting | `CR_CLAUDE_CMD` / `--cmd` | `CR_CODEX_CMD` / `--cmd` |
-| which session is mine | `~/.claude/sessions/<pid>.json`, read outright | the fold phrase's nonce, echoed into the rollout |
+| which session is mine | `~/.claude/sessions/<pid>.json`, read outright | codex's own log, which names each thread's process |
 | context window | the model profile table, corrected by claude's own statusline | stated in every rollout row |
 | restart point under `CR_CONTEXT_RESTART=1` | 51% of the window | the hard cap minus `CR_CODEX_RESERVE_TOKENS` |
 | "the turn is over" | the transcript falling quiet | the rollout's own `task_complete` row |

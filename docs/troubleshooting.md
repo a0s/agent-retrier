@@ -22,8 +22,8 @@ session's own `start: … → … → exit:` sequence out of the interleaved fil
 This used to be a real hazard — the wrapper guessed which transcript was
 "ours" by which file grew last, and a neighbour under the same working
 directory could briefly win that guess. It no longer does: claude identifies
-its own transcript from `~/.claude/sessions/<pid>.json`, and codex confirms
-its rollout with the fold phrase's own nonce echoed back into it — see
+its own transcript from `~/.claude/sessions/<pid>.json`, and codex's from its
+own log, which names the process behind every thread — see
 [context-restart.md](context-restart.md#which-session-is-mine) for the whole
 chain. Each session also gets its own handoff file (`{id}` in
 `CR_HANDOFF_FILE`, or the wrapper's own registry-based coordination when you
@@ -119,8 +119,8 @@ for the full unfold sequence and why giving up looks the way it does.
   ships as `/bin/bash`, cannot be asked for an alias body at all and falls back
   to running the alias through `bash -i`.)
 - The context restart reads its figures from one transcript at a time, the one
-  this terminal's session writes. claude identifies that transcript
-  explicitly and codex confirms it by echo nonce (see
+  this terminal's session writes. claude and codex both identify that
+  transcript explicitly (see
   [two sessions in one project](#two-sessions-in-one-project)); only for a
   Claude Code too old to write a session registry file does the wrapper fall
   back to guessing which file grew last, and only there can a neighbour under

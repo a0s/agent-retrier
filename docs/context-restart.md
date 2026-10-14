@@ -188,13 +188,15 @@ from. Three things pin down which one is this terminal's:
   lifts the log says `the limit is over; nothing typed`. The statusline proxy
   is not added there either: `agents` hands `--settings` on to every session
   dispatched from it.
-- **codex** has no such file to read (a rollout's head names no pid), so
-  identity rests on the one thing nobody else can produce: the fold phrase's
-  nonce (`HANDOFF-xxxxxxxx`), unique machine-wide. Its echo landing in a
-  rollout is the proof that rollout is really this session's — see
-  [codex: two sessions in one directory](codex.md#two-sessions-in-one-directory)
-  for how the wrapper reads, but does not act on, a candidate before that
-  proof arrives.
+- **codex** names its thread in its own log database, against the pid of the
+  process that wrote the row (`CodexSessionRegistry`) — and does so as it
+  makes the thread, before the thread has a rollout to read. Until it has
+  one, the wrapper follows nothing, the same wait as claude's. Where the log
+  cannot say (an older codex), identity falls back on the one thing nobody
+  else can produce: the fold phrase's nonce (`HANDOFF-xxxxxxxx`), unique
+  machine-wide, whose echo landing in a rollout proves that rollout is this
+  session's — see
+  [codex: two sessions in one directory](codex.md#two-sessions-in-one-directory).
 - Either way, `bind_transcript` is the one place the wrapper ever switches
   which file it is reading. The context percentage, whether the session
   counts as busy, the alive check that clears a wait, and the fold/clear/resume

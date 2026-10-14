@@ -21,6 +21,12 @@ the streak, and the next stall starts back at a minute. The usual gates still
 apply: nothing is typed while the session is mid-turn or while there is an
 unsent draft in the prompt box.
 
+Only this terminal's own session is nudged. A usage limit is the account's,
+and one read in any session's transcript in the directory is waited out; a
+refused turn is the session's, and another codex session in the same
+directory that was refused is its own wrapper's (or its own person's) to
+nudge — typing `continue` here would start a turn nobody asked for.
+
 ## Settings
 
 `CR_STALL_WAIT_SEC` (first wait, `60`; `0` switches stalls off),

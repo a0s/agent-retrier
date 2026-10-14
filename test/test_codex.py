@@ -326,6 +326,423 @@ class TestBindingTwoLiveRollouts(unittest.TestCase):
         self.assertEqual(w.candidates, [a])
 
 
+# --------------------------------------------------------------------------- #
+# T34: which thread is ours, from codex's own log
+# --------------------------------------------------------------------------- #
+def uuid7(at):
+    """A thread id the way codex 0.16x mints one: UUIDv7, `at` in its first 48 bits."""
+    import uuid
+    ms = int(at * 1000) & ((1 << 48) - 1)
+    rand = int.from_bytes(os.urandom(10), "big")
+    return str(uuid.UUID(int=(ms << 80) | (0x7 << 76) | (((rand >> 62) & 0xFFF) << 64)
+                             | (0x2 << 62) | (rand & ((1 << 62) - 1))))
+
+
+def codex_logs(home, process_uuid=True):
+    """`$CODEX_HOME/logs_2.sqlite` with codex-cli 0.161's columns (or, with
+    `process_uuid=False`, those of a codex from before that column)."""
+    import sqlite3
+    db = sqlite3.connect(os.path.join(home, "logs_2.sqlite"))
+    db.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, "
+               "ts_nanos INTEGER NOT NULL DEFAULT 0, level TEXT NOT NULL DEFAULT 'INFO', "
+               "target TEXT NOT NULL DEFAULT 'codex_core', feedback_log_body TEXT, "
+               "thread_id TEXT, %sestimated_bytes INTEGER NOT NULL DEFAULT 0)"
+               % ("process_uuid TEXT, " if process_uuid else ""))
+    db.commit()
+    return db
+
+
+def log_row(db, pid, thread, at, body='app_server.request{rpc.method="thread/start"}'):
+    """One row of codex's log, written by `pid` about `thread` (None: threadless)
+    -- with nothing to say who wrote it, in a table from before that column."""
+    if "process_uuid" in {row[1] for row in db.execute("PRAGMA table_info(logs)")}:
+        db.execute("INSERT INTO logs (ts, feedback_log_body, thread_id, process_uuid) "
+                   "VALUES (?, ?, ?, ?)", (int(at), body, thread, "pid:%d:uuid-of-%d" % (pid, pid)))
+    else:
+        db.execute("INSERT INTO logs (ts, feedback_log_body, thread_id) VALUES (?, ?, ?)",
+                   (int(at), body, thread))
+    db.commit()
+
+
+def codex_rollout(home, thread, created, cwd, subagent=False, rows=()):
+    """The rollout codex writes for `thread`, named and filed for when it was
+    created, the way real codex names and files one (local time)."""
+    t = time.localtime(created)
+    d = os.path.join(home, "sessions", "%04d" % t.tm_year, "%02d" % t.tm_mon, "%02d" % t.tm_mday)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "rollout-%s-%s.jsonl" % (time.strftime("%Y-%m-%dT%H-%M-%S", t), thread))
+    if not os.path.exists(path):
+        meta = {"id": thread, "session_id": thread, "cwd": cwd, "originator": "codex-tui",
+                "cli_version": "0.161.0", "thread_source": "subagent" if subagent else "user",
+                "source": {"subagent": {"thread_spawn": {}}} if subagent else "cli"}
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"timestamp": "x", "type": "session_meta", "payload": meta}) + "\n")
+    with open(path, "a", encoding="utf-8") as fh:
+        for rtype, payload in rows:
+            # Raw UTF-8, as codex writes it: the default phrase has an em dash.
+            fh.write(json.dumps({"timestamp": "x", "type": rtype, "payload": payload},
+                                ensure_ascii=False) + "\n")
+    return path
+
+
+def a_turn(tokens):
+    """One whole turn of a codex session: opened, the model named, a count, closed."""
+    return [("event_msg", {"type": "task_started", "model_context_window": 258400}),
+            ("turn_context", {"model": "gpt-5.6-sol"}), token_count(tokens), task_complete()]
+
+
+class TestCodexSessionRegistry(unittest.TestCase):
+    """`CodexSessionRegistry.lookup()` in isolation: which thread codex's log
+    says the codex we forked (pid 111) is running."""
+
+    CHILD = 111
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="cr-codex-reg-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.work = os.path.join(self.home, "work")
+        os.makedirs(self.work)
+        self.t0 = time.time() - 600          # when this wrapper started
+        self.db = codex_logs(self.home)
+        self.logged = []
+
+    def registry(self, table=None, resuming=False, child=CHILD):
+        self.agent = cr.CodexAgent(home=self.home, cwd=self.work, now=self.t0,
+                                   resuming=resuming)
+        return cr.CodexSessionRegistry(child, self.agent, started_at=self.t0,
+                                       log=self.logged.append,
+                                       proc_table=lambda: dict(table or {}))
+
+    def thread(self, pid, offset, rows=None, subagent=False):
+        """A thread `pid` created `offset` seconds after we started, and logged."""
+        tid = uuid7(self.t0 + offset)
+        log_row(self.db, pid, tid, self.t0 + offset)
+        path = None
+        if rows is not None:
+            path = codex_rollout(self.home, tid, self.t0 + offset, self.work,
+                                 subagent=subagent, rows=rows)
+        return tid, path
+
+    def test_our_thread_is_named_before_it_has_a_rollout(self):
+        # codex logs `thread/start` as it starts; the file waits for the
+        # first message. Named, with nowhere to read: every rollout in the
+        # directory is somebody else's.
+        reg = self.registry()
+        tid, _ = self.thread(self.CHILD, 1)
+        rec, why = reg.lookup()
+        self.assertEqual(rec, {"sessionId": tid, "path": None})
+        self.assertEqual(why, "pid 111 in codex's log; no rollout yet")
+
+    def test_once_written_its_rollout_is_the_session(self):
+        reg = self.registry()
+        tid, _ = self.thread(self.CHILD, 1)
+        reg.lookup()
+        path = codex_rollout(self.home, tid, self.t0 + 1, self.work, rows=a_turn(9000))
+        rec, why = reg.lookup()
+        self.assertEqual(rec, {"sessionId": tid, "path": path})
+        self.assertEqual(why, "pid 111 in codex's log")
+
+    def test_a_neighbours_thread_is_never_ours_even_alone(self):
+        # The later wrapper of the pair, whose codex has said nothing: the
+        # neighbour's rollout is the only one there is, and it is theirs.
+        reg = self.registry(table={222: 1})
+        _, theirs = self.thread(222, 1, rows=a_turn(250000))
+        self.assertEqual(reg.lookup(), (None, None))
+        self.assertEqual(reg.strangers([theirs]), {theirs})
+
+    def test_a_codex_behind_a_shim_is_found_through_its_parent_chain(self):
+        # The cmux shim, or npm's codex.js: what we fork is not codex itself.
+        reg = self.registry(table={300: self.CHILD, self.CHILD: 1})
+        tid, path = self.thread(300, 1, rows=a_turn(9000))
+        rec, why = reg.lookup()
+        self.assertEqual(rec["sessionId"], tid)
+        self.assertEqual(why, "descendant of pid 111 in codex's log")
+
+    def test_a_codex_the_session_ran_itself_does_not_displace_it(self):
+        # `codex exec` run from inside the session's own shell: a codex below
+        # ours, in our directory, writing a user rollout of its own.
+        table = {self.CHILD: 1, 250: self.CHILD, 260: 250}
+        reg = self.registry(table=table)
+        ours, path = self.thread(self.CHILD, 1, rows=a_turn(9000))
+        nested, nested_path = self.thread(260, 60, rows=a_turn(500))
+        rec, _ = reg.lookup()
+        self.assertEqual(rec["sessionId"], ours)
+        self.assertEqual(reg.strangers([path, nested_path]), {nested_path})
+
+    def test_a_subagent_logs_under_our_pid_and_is_not_the_session(self):
+        reg = self.registry()
+        ours, path = self.thread(self.CHILD, 1, rows=a_turn(9000))
+        self.thread(self.CHILD, 30, rows=a_turn(500), subagent=True)
+        log_row(self.db, self.CHILD, ours, self.t0 + 31)
+        rec, _ = reg.lookup()
+        self.assertEqual(rec, {"sessionId": ours, "path": path})
+
+    def test_a_clear_moves_the_session_once_the_new_thread_is_written(self):
+        # `/clear` makes the new thread at once and its file at the resume
+        # phrase. Until then the session stays where the restart left it.
+        reg = self.registry()
+        old, old_path = self.thread(self.CHILD, 1, rows=a_turn(200000))
+        new, _ = self.thread(self.CHILD, 120)
+        self.assertEqual(reg.lookup()[0], {"sessionId": old, "path": old_path})
+        new_path = codex_rollout(self.home, new, self.t0 + 120, self.work, rows=a_turn(5000))
+        log_row(self.db, self.CHILD, new, self.t0 + 140)
+        self.assertEqual(reg.lookup()[0], {"sessionId": new, "path": new_path})
+
+    def test_rows_from_before_we_started_are_not_read(self):
+        # A pid reused from a codex that exited before we were started.
+        reg = self.registry()
+        stale = uuid7(self.t0 - 3600)
+        log_row(self.db, self.CHILD, stale, self.t0 - 3600)
+        codex_rollout(self.home, stale, self.t0 - 3600, self.work, rows=a_turn(250000))
+        self.assertEqual(reg.lookup(), (None, None))
+
+    def test_a_log_that_cannot_say_who_wrote_a_row_is_unavailable(self):
+        os.remove(os.path.join(self.home, "logs_2.sqlite"))
+        codex_logs(self.home, process_uuid=False)
+        reg = self.registry()
+        self.assertEqual(reg.lookup(), (None, None))
+        self.assertTrue(reg.unavailable)
+        self.assertEqual(len([ln for ln in self.logged if "does not say which process" in ln]), 1)
+        reg.lookup()
+        self.assertEqual(len([ln for ln in self.logged if "does not say which process" in ln]), 1)
+
+    def test_no_log_yet_is_only_not_yet(self):
+        os.remove(os.path.join(self.home, "logs_2.sqlite"))
+        reg = self.registry()
+        self.assertEqual(reg.lookup(), (None, None))
+        self.assertFalse(reg.unavailable)
+
+    def test_a_resumed_thread_is_found_in_the_day_it_was_made(self):
+        # `codex resume`: a thread a month old, in a directory the three-day
+        # scan never looks at, named by our pid as it is reopened.
+        reg = self.registry(resuming=True)
+        made = self.t0 - 30 * 86400
+        tid = uuid7(made)
+        path = codex_rollout(self.home, tid, made, self.work, rows=a_turn(120000))
+        os.utime(path, (made, made))
+        log_row(self.db, self.CHILD, tid, self.t0 + 1)
+        self.assertEqual(reg.lookup()[0], {"sessionId": tid, "path": path})
+        # ...and its history is not news: it is read from where it stands.
+        self.assertEqual(self.agent.seed_offset(path), os.path.getsize(path))
+        self.assertEqual(reg.strangers([path]), set())
+
+    def test_a_resumed_rollouts_history_is_not_read_as_news(self):
+        # `codex resume` on a session that hit its limit last month. The file
+        # turns up by its mtime the moment codex appends to it, and used to
+        # be read from byte 0 like a new one: last month's limit, scheduled
+        # as a wait today.
+        made = self.t0 - 30 * 86400
+        tid = uuid7(made)
+        path = codex_rollout(self.home, tid, made, self.work, rows=a_turn(120000) + [
+            task_complete(error={"message": OUT_OF_QUOTA,
+                                 "codex_error_info": "usage_limit_exceeded"}, last=None)])
+        os.utime(path, (made, made))
+        agent = cr.CodexAgent(home=self.home, cwd=self.work, now=self.t0)
+        w = cr.TranscriptWatcher(agent=agent, poll=0, now=self.t0)
+        os.utime(path, None)                         # codex appended to it just now
+        self.assertIn(path, agent.paths(self.t0 + 60))
+        found = w.poll_now(self.t0 + 60)
+        self.assertEqual([r for r in found if r["kind"] == "limit"], [])
+        codex_rollout(self.home, tid, made, self.work, rows=a_turn(125000))
+        found = w.poll_now(self.t0 + 62)
+        self.assertIn(125000, [r.get("tokens") for r in found])
+
+    def test_a_thread_made_before_we_started_is_a_stranger_unless_we_resume(self):
+        old, path = self.thread(222, -120, rows=a_turn(250000))
+        reg = self.registry()
+        reg.lookup()
+        self.assertEqual(reg.strangers([path]), {path})        # the log says so too
+        os.remove(os.path.join(self.home, "logs_2.sqlite"))
+        quiet = self.registry()                                  # ...and without a log
+        self.assertEqual(quiet.strangers([path]), {path})
+        self.assertEqual(self.registry(resuming=True).strangers([path]), set())
+        self.assertEqual(self.agent.seed_offset(path), os.path.getsize(path))
+
+
+class TestTwoCodexSessionsInOneDirectory(unittest.TestCase):
+    """T34 from end to end, without a pty: the real registry, the real watcher
+    and the real controller, handed rows the way `main()` hands them.
+
+    Two codex sessions in one directory, as the owner's log has them on
+    2026-10-08 in some_game: wrapper 9345 started at 19:38, its rollout bound
+    at 19:39; wrapper 75256 started at 19:54 and was `context bound` to 9345's
+    rollout ten seconds later; 9345, seeing two, held its restart from
+    19:55:42 and was next heard from when codex had compacted the thread
+    itself, at the cap. Both are reproduced here, and both were what the
+    script did before `CodexSessionRegistry` (absent, this builds none)."""
+
+    THRESHOLD = 194400
+    OURS, THEIRS = 111, 222
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="cr-codex-pair-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.work = os.path.join(self.home, "work")
+        os.makedirs(self.work)
+        self.db = codex_logs(self.home)
+        self.typed = []
+        self.logged = []
+
+    def start(self, at, logs=True):
+        """Our wrapper, started at `at`, its codex forked as pid OURS."""
+        self.t0 = at
+        cfg = dict(cr.CFG)
+        cfg.update(RESTART)                  # the phrases: bash supplies them, not CFG
+        cfg.update(codex_context_tokens=self.THRESHOLD, wait_scale=1, margin=0,
+                   user_idle=0, root_idle=0, handoff_file=os.path.join(self.home, "handoff.md"),
+                   codex_folds_file=os.path.join(self.home, "folds.json"))
+        self.ctl = cr.Controller(cr.agent_cfg(cfg, "codex"), self.logged.append, now=at)
+        agent = cr.CodexAgent(home=self.home, cwd=self.work, now=at)
+        Registry = getattr(cr, "CodexSessionRegistry", None)
+        registry = Registry(self.OURS, agent, started_at=at, log=self.logged.append,
+                            proc_table=lambda: {self.OURS: 1, self.THEIRS: 1}) if Registry else None
+        self.w = cr.TranscriptWatcher(agent=agent, poll=0, now=at, registry=registry,
+                                      log=self.logged.append)
+        self.watching = None
+
+    def thread(self, pid, created, rows=None):
+        tid = uuid7(created)
+        log_row(self.db, pid, tid, created)
+        return tid, (codex_rollout(self.home, tid, created, self.work, rows=rows)
+                     if rows is not None else None)
+
+    def turn(self, at):
+        """One turn of the supervisor's loop at `at`: what `main()` does with a poll."""
+        w, ctl = self.w, self.ctl
+        recs = w.poll_now(at)
+        if w.current and w.current != ctl.context_path:
+            why = "session identity" if w.bound_session_id else "fallback heuristic"
+            ctl.bind_transcript(w.current, why, at)
+        ctl.on_candidates(w.guessing and len(w.candidates) > 1 and not w.confirmed
+                          and not w.bound_session_id, at)
+        for rec in recs:
+            if rec["kind"] == "echo":
+                if (ctl.handoff_text and rec["text"] == ctl.handoff_text
+                        and ctl.on_handoff_echo(rec["path"], at)):
+                    w.confirm(rec["path"])
+                continue
+            if rec["kind"] == "alive" and rec["path"] == w.current:
+                ctl.on_context(rec, at)
+                if rec.get("turn"):
+                    ctl.on_turn(rec["turn"], at)
+        ctl.note_growth(w.grown, at)
+        action = ctl.tick(at)
+        if ctl.handoff_text != self.watching:
+            if self.watching:
+                w.forget(self.watching)
+            self.watching = ctl.handoff_text
+            if self.watching:
+                w.expect(self.watching)
+        if action and action[0] == "inject":
+            self.typed.append(action[1])
+        return action
+
+    def folded(self):
+        return [t for t in self.typed if self.ctl.nonce and self.ctl.nonce in t] or \
+               [ln for ln in self.logged if "folding up" in ln]
+
+    def test_the_later_session_is_not_folded_on_its_neighbours_count(self):
+        # The neighbour started ten minutes before us and has been talking
+        # since; ours has said nothing, so it has no rollout at all.
+        t0 = time.time() - 3600
+        theirs, their_path = self.thread(self.THEIRS, t0 + 1, rows=a_turn(150000))
+        self.start(t0 + 600)
+        ours, _ = self.thread(self.OURS, t0 + 601)
+        for i, at in enumerate((602, 604, 606, 640, 700)):
+            codex_rollout(self.home, theirs, t0 + 1, self.work,
+                          rows=a_turn(250000) if i == 1 else [("event_msg", {"type": "x"})])
+            self.turn(t0 + at)
+            self.assertIsNone(self.ctl.context_path)
+        self.assertEqual(self.folded(), [])
+        self.assertNotIn(theirs, "".join(self.logged))
+        self.assertIn("session bound: %s (pid 111 in codex's log; no rollout yet)" % ours,
+                      self.logged)
+        # Then ours is spoken to, and it is ours that is followed from then on.
+        path = codex_rollout(self.home, ours, t0 + 601, self.work, rows=a_turn(9000))
+        self.turn(t0 + 702)
+        self.assertEqual(self.ctl.context_path, path)
+        self.assertEqual(self.ctl.context_tokens, 9000)
+
+    def test_the_earlier_session_still_folds_once_a_neighbour_has_started(self):
+        # We started first, and our rollout is the only one; then a neighbour
+        # starts and speaks. Ours climbs past the threshold and goes quiet.
+        t0 = time.time() - 40000
+        self.start(t0)
+        ours, path = self.thread(self.OURS, t0 + 1, rows=a_turn(150000))
+        self.turn(t0 + 10)
+        self.assertEqual(self.ctl.context_path, path)
+        self.thread(self.THEIRS, t0 + 400, rows=a_turn(10000))
+        self.turn(t0 + 402)
+        codex_rollout(self.home, ours, t0 + 1, self.work, rows=a_turn(250000))
+        for at in (404, 406, 410):
+            self.turn(t0 + at)
+        self.assertTrue(self.folded(), self.logged)
+        self.assertFalse([ln for ln in self.logged if "candidate rollout" in ln])
+
+    def test_without_a_log_that_names_processes_the_hold_still_gives_way(self):
+        # A codex too old to record who wrote a row: no name for anyone, the
+        # heuristic, and T03's hold over two candidates -- which is the
+        # right thing to do for a while, and was the wrong thing to do for
+        # ten hours (the probe that found it went on longer still).
+        os.remove(os.path.join(self.home, "logs_2.sqlite"))
+        self.db = codex_logs(self.home, process_uuid=False)
+        t0 = time.time() - 40000
+        self.start(t0)
+        ours, path = self.thread(self.OURS, t0 + 1, rows=a_turn(150000))
+        self.turn(t0 + 10)
+        self.thread(self.THEIRS, t0 + 400, rows=a_turn(10000))
+        self.turn(t0 + 402)
+        codex_rollout(self.home, ours, t0 + 1, self.work, rows=a_turn(250000))
+        self.turn(t0 + 404)
+        self.assertIn("more than one candidate rollout in this directory; holding the restart "
+                      "until the handoff phrase proves which is ours", self.logged)
+        self.turn(t0 + 406)
+        self.assertEqual(self.folded(), [])                 # held, as T03 holds it
+        for at in range(410, 36000, 60):
+            if self.folded():
+                break
+            self.turn(t0 + at)
+        self.assertTrue(self.folded(), self.logged[-5:])
+        held = [ln for ln in self.logged if "for want of a proof" in ln]
+        self.assertEqual(len(held), 1)
+        # The phrase lands in the rollout it was folded on: proven, and on it goes.
+        codex_rollout(self.home, ours, t0 + 1, self.work,
+                      rows=[message("user", self.ctl.handoff_text)])
+        self.turn(t0 + at + 2)
+        self.assertEqual(self.ctl.rstate, cr.HANDOFF_SENT)
+        self.assertTrue(self.ctl.handoff_echoed)
+        self.assertTrue(self.w.confirmed)
+
+    def test_a_fold_on_a_wrong_guess_is_called_off_where_it_lands(self):
+        # Same old codex. This time the guess is the neighbour's: it is the
+        # one that kept growing, and it is the one past the threshold. When
+        # the hold gives way the phrase goes into OUR session -- everything
+        # typed does -- and its echo says the count was never ours.
+        os.remove(os.path.join(self.home, "logs_2.sqlite"))
+        self.db = codex_logs(self.home, process_uuid=False)
+        t0 = time.time() - 40000
+        self.start(t0)
+        ours, path = self.thread(self.OURS, t0 + 1, rows=a_turn(9000))
+        self.turn(t0 + 10)
+        theirs, their_path = self.thread(self.THEIRS, t0 + 30, rows=a_turn(150000))
+        self.turn(t0 + 32)
+        codex_rollout(self.home, theirs, t0 + 30, self.work, rows=a_turn(250000))
+        at = 34
+        while not self.folded() and at < 36000:
+            self.turn(t0 + at)
+            at += 60
+        self.assertTrue(self.folded())
+        self.assertEqual(self.ctl.context_path, their_path)       # what it folded on
+        codex_rollout(self.home, ours, t0 + 1, self.work,
+                      rows=[message("user", self.ctl.handoff_text)])
+        self.turn(t0 + at)
+        self.assertEqual(self.ctl.context_path, path)
+        self.assertEqual(self.ctl.rstate, cr.CANCEL_PENDING)
+        self.assertIn("restart aborted at handoff_sent: the handoff phrase landed in another "
+                      "rollout than the one whose count it was folded on", self.logged)
+        self.assertTrue(self.w.confirmed)
+
+
 class TestPickingTheAgent(unittest.TestCase):
     def test_a_codex_binary_is_recognised(self):
         self.assertEqual(cr.pick_agent("auto", ["/Users/x/.local/bin/codex"]), "codex")
@@ -575,6 +992,79 @@ class TestCandidateModeHoldsTheFoldBack(unittest.TestCase):
         ctl = self.ctl()
         feed(ctl, 1, window=WINDOW, tokens=WINDOW)
         self.assertEqual(ctl.tick(2)[0], "inject")
+
+    # -- T34: the hold is not for good --------------------------------------- #
+    def test_the_hold_gives_way_and_says_so_once(self):
+        # The proof the hold waits for is the fold phrase's echo, and only a
+        # fold types the phrase. Held for good, a session never folded again.
+        ctl = self.ctl()
+        feed(ctl, 1, window=WINDOW, tokens=WINDOW)
+        ctl.on_candidates(True, 1)
+        for at in (2, 60, ctl.PROOF_WAIT):
+            self.assertIsNone(ctl.tick(at))
+        self.assertEqual(ctl.tick(ctl.PROOF_WAIT + 2)[0], "inject")
+        said = [l for l in ctl.log_lines if "for want of a proof" in l]
+        self.assertEqual(len(said), 1)
+
+    def test_the_wait_is_for_a_fold_that_is_due_not_for_the_ambiguity(self):
+        # Ambiguous for an hour below the threshold is no wait at all: the
+        # hold starts holding when there is a fold to hold.
+        ctl = self.ctl()
+        ctl.on_candidates(True, 1)
+        feed(ctl, 2, window=WINDOW, tokens=20000)
+        self.assertIsNone(ctl.tick(3600))
+        feed(ctl, 3601, window=WINDOW, tokens=WINDOW)
+        self.assertIsNone(ctl.tick(3602))
+        self.assertIsNone(ctl.tick(3601 + ctl.PROOF_WAIT - 1))
+        self.assertEqual(ctl.tick(3602 + ctl.PROOF_WAIT)[0], "inject")
+
+    def test_a_fold_the_hold_let_through_never_interrupts_a_turn(self):
+        # Esc mid-turn is not done to a session on a count that may be a
+        # neighbour's. Past the interrupt line, with a turn running, a proven
+        # reading interrupts; an unproven one waits for the turn to end.
+        ctl = self.ctl(codex_interrupt=True)
+        feed(ctl, 1, window=WINDOW, tokens=WINDOW - 1000, turn="open")
+        ctl.on_candidates(True, 1)
+        self.assertIsNone(ctl.tick(2))                       # held: the wait starts
+        self.assertIsNone(ctl.tick(2 + ctl.PROOF_WAIT))      # ...and is over, but not by Esc
+        self.assertTrue([l for l in ctl.log_lines if "for want of a proof" in l])
+        self.assertIn("restart step held: a turn is still running", ctl.log_lines[-1])
+        self.assertIsNone(ctl.tick(4 + ctl.PROOF_WAIT))
+        feed(ctl, 5 + ctl.PROOF_WAIT, turn="closed", stop_reason="end_turn")
+        self.assertEqual(ctl.tick(6 + ctl.PROOF_WAIT)[0], "inject")
+
+    def test_an_unproven_fold_whose_echo_lands_where_it_was_read_goes_on(self):
+        ctl = self.ctl()
+        feed(ctl, 1, window=WINDOW, tokens=WINDOW)
+        ctl.on_candidates(True, 1)
+        ctl.tick(2)
+        self.assertEqual(ctl.tick(3 + ctl.PROOF_WAIT)[0], "inject")
+        self.assertTrue(ctl.on_handoff_echo(ROLL, 4 + ctl.PROOF_WAIT))
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+
+    def test_an_unproven_fold_whose_echo_lands_elsewhere_is_called_off(self):
+        ctl = self.ctl()
+        feed(ctl, 1, window=WINDOW, tokens=WINDOW)
+        ctl.on_candidates(True, 1)
+        ctl.tick(2)
+        self.assertEqual(ctl.tick(3 + ctl.PROOF_WAIT)[0], "inject")
+        mine = "/codex/sessions/rollout-really-mine.jsonl"
+        self.assertTrue(ctl.on_handoff_echo(mine, 4 + ctl.PROOF_WAIT))
+        self.assertEqual(ctl.context_path, mine)
+        self.assertEqual(ctl.rstate, cr.CANCEL_PENDING)
+        # ...and what goes out next is the phrase that calls it off.
+        action = ctl.tick(5 + ctl.PROOF_WAIT)
+        self.assertEqual(action[0], "inject")
+        self.assertIn("cancelled", action[1])
+
+    def test_a_proven_fold_whose_echo_lands_elsewhere_is_not_called_off(self):
+        # The echo landing elsewhere after an ordinary fold is T06's old case:
+        # the binding is corrected and the restart goes on, as it always did.
+        ctl = self.ctl()
+        feed(ctl, 1, window=WINDOW, tokens=WINDOW)
+        self.assertEqual(ctl.tick(2)[0], "inject")
+        self.assertTrue(ctl.on_handoff_echo("/codex/sessions/rollout-other.jsonl", 3))
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
 
 
 class TestTheCodexThreshold(unittest.TestCase):
@@ -1774,12 +2264,11 @@ class TestCodexEndToEnd(PtyTestCase):
                         self.logged())
 
     def test_only_the_session_above_threshold_gets_a_fold(self):
-        # Two wrapped codex processes, same cwd, same CODEX_HOME (T03): the
-        # quiet one's rollout and the busy one's both pass `keep` -- cwd is
-        # all either wrapper has to go on -- so the quiet one has no way to
-        # be SURE the climbing count it can see belongs to somebody else. It
-        # has to hold its own restart back rather than guess, and only the
-        # session that is actually over the threshold may ever see the
+        # Two wrapped codex processes, same cwd, same CODEX_HOME: the quiet
+        # one's rollout and the busy one's both pass `keep` -- cwd is all a
+        # rollout has to go on. codex's log is what tells them apart (T34):
+        # each wrapper is told its own thread by its own child's pid, and only
+        # the session that is actually over the threshold may ever see the
         # handoff phrase.
         quiet = self.session(env=self.restart_env(FAKE_USAGE="1000"), cwd=self.work)
         self.assertTrue(quiet.read_until("ready", timeout=10))
@@ -1793,10 +2282,104 @@ class TestCodexEndToEnd(PtyTestCase):
         quiet.drain(1.5)
         self.assertNotIn("GOT:handoff", quiet.buf)
         # Not that quiet happened to be looking at its own rollout: that it
-        # saw two, could not tell them apart, and said so.
+        # was told which one is its own, and never had to guess.
+        self.assertIn("session bound: ", self.logged_by(quiet))
+        self.assertIn("in codex's log)", self.logged_by(quiet))
+        self.assertNotIn("candidate rollout", self.logged_by(quiet))
+        self.assertNotIn("fallback heuristic", self.logged_by(quiet))
+        self.assertNotIn("folding up", self.logged_by(quiet))
+        self.assertIn("folding up", self.logged_by(busy))
+
+    def test_without_a_log_that_names_processes_the_quiet_one_still_holds(self):
+        # An older codex, whose log does not say who wrote a row: the same
+        # pair is told apart the way T03 told it apart, and the quiet one
+        # holds its own restart back rather than guess.
+        quiet = self.session(env=self.restart_env(FAKE_USAGE="1000", FAKE_LOG_PID="0"),
+                             cwd=self.work)
+        self.assertTrue(quiet.read_until("ready", timeout=10))
+        busy = self.session(env=self.restart_env(FAKE_LOG_PID="0"), cwd=self.work)
+        self.assertTrue(busy.read_until("GOT:handoff", timeout=30), busy.buf[-500:])
+        quiet.drain(1.5)
+        self.assertNotIn("GOT:handoff", quiet.buf)
+        self.assertIn("does not say which process wrote a row", self.logged_by(quiet))
         self.assertIn("more than one candidate rollout", self.logged_by(quiet))
         self.assertNotIn("folding up", self.logged_by(quiet))
         self.assertIn("folding up", self.logged_by(busy))
+
+    # -- T34: two codex sessions in one directory, as the log found them ------ #
+    def test_a_session_that_has_said_nothing_is_not_folded_on_its_neighbours_count(self):
+        # some_game, 2026-10-08: wrapper 75256 was `context bound` to its
+        # neighbour's rollout ten seconds after starting. Its own codex had
+        # said nothing yet, so it had no rollout at all -- codex makes one at
+        # a thread's first message -- and the neighbour's was the only one.
+        busy = self.session(env=self.restart_env(FAKE_USAGE=""), cwd=self.work)
+        self.assertTrue(busy.read_until("ready", timeout=10))
+        later = self.session(env=self.restart_env(FAKE_USAGE="", FAKE_LAZY_ROLLOUT="1"),
+                             cwd=self.work)
+        self.assertTrue(later.read_until("ready", timeout=10))
+        # Watching before the neighbour's count climbs: told whose thread it
+        # is, with no file to read yet. (Asserted below rather than here, so
+        # that a wrapper that is told nothing still shows what it does next.)
+        deadline = time.time() + 10
+        while "no rollout yet)" not in self.logged_by(later) and time.time() < deadline:
+            later.drain(0.05)
+        busy.send("usage 200000\r")
+        self.assertTrue(busy.read_until("GOT:handoff", timeout=30), busy.buf[-500:])
+        # As in the test above: what is left is how far apart two loops can
+        # reach the same decision about the same count.
+        later.drain(1.5)
+        self.assertNotIn("GOT:handoff", later.buf)
+        mine = self.logged_by(later)
+        self.assertNotIn("folding up", mine)
+        self.assertNotIn("context bound", mine)
+        self.assertNotIn("200k", mine)
+        self.assertIn("in codex's log; no rollout yet)", mine)
+
+    def test_the_earlier_session_still_folds_once_a_neighbour_has_started(self):
+        # The other half of the same evening: wrapper 9345, which had been
+        # following its own rollout for a quarter of an hour, saw a second
+        # one appear, held its restart "until the handoff phrase proves which
+        # is ours", and never typed that phrase again.
+        first = self.session(env=self.restart_env(FAKE_USAGE=""), cwd=self.work)
+        self.assertTrue(first.read_until("ready", timeout=10))
+        self.assertTrue(self.wait_for_log("context bound", first), self.logged_by(first))
+        second = self.session(env=self.restart_env(FAKE_USAGE=""), cwd=self.work)
+        self.assertTrue(second.read_until("ready", timeout=10))
+        self.assertTrue(second.roundtrip(), second.buf[-500:])    # it has a rollout, and it grew
+        first.send("usage 200000\r")
+        self.assertTrue(first.read_until("GOT:handoff", timeout=30), first.buf[-500:])
+        self.assertNotIn("candidate rollout", self.logged_by(first))
+        second.drain(1.5)
+        self.assertNotIn("GOT:handoff", second.buf)
+
+    def test_a_neighbours_refused_turn_is_not_nudged_in_this_session(self):
+        # A refused turn is the session's, not the account's: the neighbour's
+        # wrapper types `continue` into the neighbour. Ours never stopped.
+        env = dict(CR_WAIT_SCALE="60", FAKE_USAGE="")
+        ours = self.session(env=self.restart_env(**env), cwd=self.work)
+        self.assertTrue(ours.read_until("ready", timeout=10))
+        theirs = self.session(env=self.restart_env(**env), cwd=self.work)
+        self.assertTrue(theirs.read_until("ready", timeout=10))
+        self.assertTrue(self.wait_for_log("context bound", ours), self.logged_by(ours))
+        self.assertTrue(self.wait_for_log("context bound", theirs), self.logged_by(theirs))
+        theirs.send("refuse\r")
+        self.assertTrue(theirs.read_until("GOT:continue", timeout=25), theirs.buf[-500:])
+        self.caught_up(ours)
+        self.assertNotIn("stall detected", self.logged_by(ours))
+        self.assertNotIn("GOT:continue", ours.buf)
+
+    def test_a_restart_unfolds_into_a_thread_that_has_no_rollout_yet(self):
+        # Real codex makes the thread at `/clear` and its rollout only when
+        # the resume phrase is typed into it. The log names the new thread at
+        # once; the restart stays on the old rollout until the new one exists,
+        # and then follows it there.
+        s = self.session(env=self.restart_env(FAKE_LAZY_ROLLOUT="1"), cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_for_log("context restarted", s), self.logged())
+        self.assertIn("the clear took hold (the screen went quiet)", self.logged())
+        self.assertIn("session rebound: ", self.logged())
 
 
 if __name__ == "__main__":

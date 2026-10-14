@@ -158,6 +158,7 @@ deliberately spends quota, and which nothing else depends on.
 | [T31](T31-kitty-keys-in-the-draft-gate.md) | The draft gate under the kitty keyboard protocol | P0 | B |
 | [T32](T32-session-not-yet-named.md) | A session that is not named yet is not guessed at | P0 | A |
 | [T33](T33-attach-and-roster-identity.md) | `claude attach` is its job's session, and the roster is nobody's | P0 | A |
+| [T34](T34-codex-session-named-by-its-log.md) | A codex session is named by codex's own log | P0 | A |
 
 Epics: A — session identity; B — restart-machine guarantees; C — models and
 windows; D — per-agent commands and input; E — miscellaneous; F — subagent

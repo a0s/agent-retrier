@@ -66,40 +66,64 @@ restart. When codex is given `--cd`, that directory is the one followed.
 
 ### Two sessions in one directory
 
-A rollout's head names no pid, and codex ships nothing else that reliably
-does either (no usable lock file, and `lsof` does not report an append-open
-the way it would for a process holding the file for writing). So two codex
-sessions started in the same `cwd` are, on paper, indistinguishable: both
-pass the `cwd`/`thread_source` check above, and either one's rollout could be
-this terminal's.
+A rollout's head names no pid, so two codex sessions started in the same
+`cwd` both pass the `cwd`/`thread_source` check above, and on the rollouts
+alone either one could be this terminal's. codex's log database says which:
+`$CODEX_HOME/logs_2.sqlite` — the same file the wrapper reads codex's own
+context count from ([below](#staying-ahead-of-codexs-own-compaction)) — tags
+every row with the thread it is about and the process that wrote it
+(`process_uuid = pid:<pid>:<uuid>`). The wrapper knows the pid it forked, so
+the threads that process logs are this session's, and nobody else's are (T34).
 
-The wrapper picks a "current" candidate the same way it always has (whichever
-recently-created rollout is growing — see `TranscriptWatcher._pick_current`
-in the source), and reads usage from it right away. But that pick is only a
-guess until something proves it: the [context restart](context-restart.md)'s
-fold phrase carries a nonce unique machine-wide, and its echo landing in a
-rollout is the one piece of proof that rollout is really this session's.
-Until that has happened, and only while more than one rollout in the
-directory still qualifies as ours (created since this wrapper started, `cwd`
-matching, not yet ruled out), the controller keeps reading — the badge and
-the log still show a context percentage — but will not act on it: no fold is
-sent while a neighbour's climbing count could be the one it just read. Once
-the echo confirms a rollout, that one is locked in for the rest of the
-session, and every other candidate seen so far is permanently ruled out —
-a neighbour growing afterwards can no longer hand `current` back to it.
+Two things about codex shape how that is read. It makes a thread as it
+starts, and again at every `/clear` or `/new`, but makes the thread's rollout
+only when the thread is first spoken to — minutes or hours later. And it logs
+the thread the moment it makes it. So:
 
-What that does not cover is a neighbour's rollout being the *only* one. Codex
-creates a rollout when a session is first spoken to, not when it starts, so a
-wrapper whose own session has said nothing yet has none — and a second session
-started in the directory since, and already at work, is then one candidate
-and not one of two. The wrapper reads it, and if that count is past the
-threshold once the neighbour's turn has ended, types the fold phrase into its
-own session. The echo corrects it from there (it is what creates this
-session's rollout, and proves which one that is), but the phrase has been
-typed by then, into a session with nothing in it to fold. Claude Code states
-which session a process is running, and the wrapper waits for that rather
-than guess ([which session is mine](context-restart.md#which-session-is-mine));
-nothing codex writes says as much.
+- **At launch**, before anything has been typed, the wrapper is told its
+  thread and that it has no rollout yet, and follows nothing: every rollout in
+  the directory is somebody else's, however busy. It waits for its own (the
+  same thing it does for Claude Code's session file — see [which session is
+  mine](context-restart.md#which-session-is-mine)), and does not give up
+  waiting.
+- **After a `/clear`**, its own restart's or yours, the new thread is named at
+  once and followed once its rollout exists, which for the restart is when the
+  resume phrase is typed into it.
+- **`codex resume`** reopens an old thread; its rollout is found by the thread's
+  id in the day it was made (codex's ids carry their creation time), and read
+  from where it stands rather than from the beginning.
+- **Subagents** log under the same pid; their rollouts' heads say so and they
+  are never the session. A `codex exec` run from inside the session is a
+  codex further down the process tree, and is not the session either.
+
+The log line is `session bound: <thread id> (pid N in codex's log)` — with
+`; no rollout yet` while that is so — and `session rebound: … → …` at a clear.
+
+#### When the log cannot say
+
+A codex too old to record `process_uuid` in its log (the wrapper says
+`codex's log database … does not say which process wrote a row`), or one
+whose log never names the wrapper's pid within `CR_SESSION_GRACE_SEC`, leaves
+the wrapper to the guess it always made: whichever rollout is growing (see
+`TranscriptWatcher._pick_current` in the source). Two things keep that guess
+off a neighbour where they can. A rollout whose thread was made before the
+wrapper started is never its own — the codex it forked makes its first
+thread as it starts — unless codex was started to `resume` one. And a rollout
+the log does pin on another process is never a candidate.
+
+Where two candidates remain, the [context restart](context-restart.md)'s fold
+phrase is the proof: it carries a nonce unique machine-wide, and its echo
+landing in a rollout proves that rollout is this session's. Until then the
+controller keeps reading — the badge and the log still show a percentage —
+but holds the fold back (`more than one candidate rollout in this directory;
+holding the restart …`), so that a neighbour's climbing count is not the one
+it acts on. Only a fold types that phrase, though, so the hold lasts five
+minutes and no longer: then the fold goes out on the reading it has, between
+turns (an unproven reading never interrupts one), and where the echo lands
+decides. In the rollout it was folded on, the restart goes on as usual.
+Anywhere else, the count was a neighbour's, and the restart is called off
+with the cancel phrase; the rollout the echo landed in is this session's from
+then on.
 
 ### `codex resume` on an old session
 
@@ -210,7 +234,8 @@ last as long as the turn does on codex, however quiet it is — that is a root
 waiting on its agents.
 
 A refused turn (`Selected model is at capacity`) on codex ends the whole turn
-and every agent with it; the wrapper [nudges it](stalls.md).
+and every agent with it; the wrapper [nudges it](stalls.md) — its own session's,
+never a neighbour's.
 
 ## Staying ahead of codex's own compaction
 

@@ -355,7 +355,7 @@ class TestWatcher(unittest.TestCase):
         self.assertEqual(w.agent_status_at, 12.345)
 
     def test_no_registry_keeps_the_growth_heuristic(self):
-        # codex, and claude with no registry passed in: unchanged behaviour.
+        # No registry passed in (codex had none before T34): unchanged behaviour.
         w = cr.TranscriptWatcher(self.dir, poll=0)
         self.append("a.jsonl", ORDINARY)
         w.poll_now()
@@ -515,7 +515,8 @@ class TestBeforeTheRegistryHasNamedAnyone(unittest.TestCase):
         self.assertFalse([ln for ln in self.logged if "falling back" in ln])
 
     def test_without_a_registry_there_is_nothing_to_wait_for(self):
-        # codex: the heuristic is all there has ever been, from the first poll.
+        # No registry at all: the heuristic, from the first poll. (codex has
+        # one since T34; see test_codex.py.)
         w = cr.TranscriptWatcher(self.dir, poll=0, now=self.START)
         self.append("a.jsonl", ORDINARY)
         w.poll_now(now=self.START + 0.2)

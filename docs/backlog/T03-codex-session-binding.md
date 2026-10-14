@@ -66,4 +66,29 @@ later is completely invisible to the wrapper — neither limits nor restart appl
 
 ## Checked
 
-_(fill in when completed)_
+Filled in by T34, on codex-cli 0.161.0 and the owner's own `~/.codex`, read
+only. No codex was running, so (a) is from the binary and the files, not
+`lsof`.
+
+- (a)/(b) `thread-writer-locks/<thread id>.lock` is empty, made when the
+  thread is made, and held with `flock` by the writing process: it names the
+  thread, and only `lsof`/`/proc` would name the holder. Not used.
+- (c) The rollout is made at the thread's **first message**, not at startup:
+  `rollout-2026-10-09T13-56-55-…` (the creation time, in local time, and the
+  thread's UUIDv7 id) was born at 13:58:56. Its lock file, and codex's log
+  row for the thread, at 13:56:55.
+- (d) `/clear` and `/new` make a new thread — a new id, a new lock, a log row
+  at once — and its rollout at its first message (11:57:21 → 12:54:50 in one
+  of the owner's sessions).
+- What does name the writer: `$CODEX_HOME/logs_2.sqlite`, whose rows carry
+  `thread_id` and `process_uuid = pid:<pid>:<uuid>`, written as a thread is
+  made (`rpc.method="thread/start"`). That is what binds a codex session now
+  (`CodexSessionRegistry`, T34).
+
+What item 2 here asked for — candidate mode, held until the echo of the
+fold phrase confirms a rollout — shipped, and broke in the field in both
+directions (T32 "Left open", T34): with our rollout not yet made, the
+neighbour's was a single candidate and was folded on; with two, the hold had
+nothing to lift it but the phrase only a fold types. It is now the fallback
+for a codex whose log does not name processes, and gives way after
+`Controller.PROOF_WAIT`.
