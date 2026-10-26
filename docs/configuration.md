@@ -225,6 +225,7 @@ More in [session-budget.md](session-budget.md). Claude only: codex is not paced.
 | `CR_BUDGET_FREEZE_MIN` | `5` | claude | freeze when the target is this many minutes away |
 | `CR_BUDGET_SLOW_MSG` | see [the messages](session-budget.md#the-messages) | claude | the slow message; `{percent}`, `{rate}`, `{forecast}`, `{resets}`, `{target}`, `{agents}`, `{file}` |
 | `CR_BUDGET_FREEZE_MSG` | see [the messages](session-budget.md#the-messages) | claude | the freeze message, typed before the handoff phrase; `{target}`, `{minutes}`, `{resets}` |
+| `CR_BUDGET_CANCEL_MSG` | see [the messages](session-budget.md#the-messages) | claude | the phrase that calls off a freeze the session had already seen; an aborted context restart keeps `CR_CANCEL_MSG` |
 
 ## Codex
 

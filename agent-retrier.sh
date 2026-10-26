@@ -476,6 +476,10 @@ CR_BUDGET_SLOW_MSG_DEFAULT='Session budget: {percent}% of the 5-hour limit used,
 # The handoff phrase follows this one, so the trailing space is part of it.
 CR_BUDGET_FREEZE_MSG_DEFAULT='Session budget: the {target}% target will be reached in about {minutes} min (reset at {resets}). Start no new agents and stop the running ones at a safe point. '
 : "${CR_BUDGET_FREEZE_MSG:=$CR_BUDGET_FREEZE_MSG_DEFAULT}"
+# Said instead of CR_CANCEL_MSG when an aborted restart was a budget freeze (T35):
+# a freeze is no context restart, and the session should not be told it was one.
+CR_BUDGET_CANCEL_MSG_DEFAULT='The session-budget freeze was cancelled — the handoff is not needed now. Continue with what you were doing before it was requested.'
+: "${CR_BUDGET_CANCEL_MSG:=$CR_BUDGET_CANCEL_MSG_DEFAULT}"
 # claude and codex do not speak the same commands, so a phrase that names one —
 # a slash command, a skill, a custom prompt — cannot be shared between them.
 # CR_CLAUDE_<X>/CR_CODEX_<X> override CR_<X> for one agent only; unset (the
@@ -935,6 +939,9 @@ BUDGET_SLOW_MSG_DEFAULT = (
 BUDGET_FREEZE_MSG_DEFAULT = (
     "Session budget: the {target}% target will be reached in about {minutes} min "
     "(reset at {resets}). Start no new agents and stop the running ones at a safe point. ")
+BUDGET_CANCEL_MSG_DEFAULT = (
+    "The session-budget freeze was cancelled — the handoff is not needed now. "
+    "Continue with what you were doing before it was requested.")
 
 
 # No single number is "the" community consensus — recommendations run 40-70%,
@@ -1064,6 +1071,7 @@ CFG = dict(
     budget_freeze_min=max(0.0, _env("CR_BUDGET_FREEZE_MIN", 5.0, float)),
     budget_slow_msg=_env("CR_BUDGET_SLOW_MSG", BUDGET_SLOW_MSG_DEFAULT),
     budget_freeze_msg=_env("CR_BUDGET_FREEZE_MSG", BUDGET_FREEZE_MSG_DEFAULT),
+    budget_cancel_msg=_env("CR_BUDGET_CANCEL_MSG", BUDGET_CANCEL_MSG_DEFAULT),
     # -- the copies of this program older versions left in $TMPDIR --
     tmp_sweep=_env("CR_TMP_SWEEP", "1") == "1",
 )
@@ -4227,7 +4235,7 @@ CONTEXT_DEFAULTS = dict(
     model_cache_ttl=604800.0, models_doc_url="", models_api_url="",
     session_budget=None, budget_window_sec=600.0, budget_freeze_min=5.0,
     forecast_file="", budget_slow_msg=BUDGET_SLOW_MSG_DEFAULT,
-    budget_freeze_msg=BUDGET_FREEZE_MSG_DEFAULT,
+    budget_freeze_msg=BUDGET_FREEZE_MSG_DEFAULT, budget_cancel_msg=BUDGET_CANCEL_MSG_DEFAULT,
 )
 
 
@@ -4734,6 +4742,8 @@ class Controller:
         self._budget_prefix = ""         # the freeze message, typed before the handoff phrase
         self._budget_resets_at = None    # when a frozen session may be unfolded
         self._budget_note = None         # what inject_note says about the next budget message
+        self.budget_cancel_text = expand_skill(
+            cfg.get("budget_cancel_msg") or BUDGET_CANCEL_MSG_DEFAULT, "claude")
 
     # -- inputs ------------------------------------------------------------- #
     # Not everything arriving on our stdin was typed. The terminal answers
@@ -6093,6 +6103,8 @@ class Controller:
             return "session budget: freezing; asking for a handoff"
         if self._budget_freeze and self.rstate == RESUME_SENT:
             return "session budget: reset reached; unfolding the handoff"
+        if self._budget_freeze and self.rstate == CANCEL_PENDING:
+            return "session budget: freeze cancelled; asking the session to carry on"
         if self._budget_note and self.rstate is None:
             note, self._budget_note = self._budget_note, None
             return note
@@ -6926,6 +6938,11 @@ class Controller:
             return None
         self._cancel_sent = True
         dismiss = self._take_dismiss()
+        if self._budget_freeze:
+            # An aborted freeze is no context restart: it is called off in its own
+            # words (T35), and CR_CANCEL_MSG stays the restart's (T09).
+            self.log("budget freeze cancelled; asking the session to carry on")
+            return ("inject", self.budget_cancel_text, dismiss)
         self.log("restart cancelled; asking the session to carry on")
         return ("inject", self.cancel_text, dismiss)
 
@@ -9093,7 +9110,7 @@ export CR_RESUME_ATTEMPTS
 export CR_HANDOFF_REGISTRY_DIR
 export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG CR_CANCEL_MSG
 export CR_SESSION_BUDGET CR_FORECAST_FILE CR_BUDGET_WINDOW_SEC CR_BUDGET_FREEZE_MIN
-export CR_BUDGET_SLOW_MSG CR_BUDGET_FREEZE_MSG
+export CR_BUDGET_SLOW_MSG CR_BUDGET_FREEZE_MSG CR_BUDGET_CANCEL_MSG
 export CR_CLAUDE_HANDOFF_MSG CR_CODEX_HANDOFF_MSG
 export CR_CLAUDE_CLEAR_CMD CR_CODEX_CLEAR_CMD
 export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG

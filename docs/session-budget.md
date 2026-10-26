@@ -67,12 +67,16 @@ a turn. Each is one line.
 |---|---|---|
 | slow | `Session budget: {percent}% of the 5-hour limit used, pace {rate}%/min, forecast {forecast}% at the reset ({resets}); target {target}%. Reduce parallel work to at most {agents} agents: start no new ones until the pace drops.` | `{percent} {rate} {forecast} {resets} {target} {agents}` |
 | freeze | `Session budget: the {target}% target will be reached in about {minutes} min (reset at {resets}). Start no new agents and stop the running ones at a safe point.` followed by the handoff phrase | `{target} {minutes} {resets}`, and the handoff phrase's own `{file}`, `{marker}` |
+| cancel | `The session-budget freeze was cancelled — the handoff is not needed now. Continue with what you were doing before it was requested.` | none |
 
 `{rate}` is percent a minute, `{forecast}` percent at the reset, `{minutes}`
 minutes to the target, `{resets}` the local time of the reset (HH:MM),
 `{agents}` the number of agents the pace allows. `{file}` is the handoff file
 and `{skill:NAME}` expands to `/NAME`, as in the other phrases. Override them
-with `CR_BUDGET_SLOW_MSG` and `CR_BUDGET_FREEZE_MSG`. The handoff phrase always
+with `CR_BUDGET_SLOW_MSG`, `CR_BUDGET_FREEZE_MSG` and `CR_BUDGET_CANCEL_MSG`. The
+cancel phrase is typed only when a freeze is called off after the session has
+seen its freeze phrase; an aborted context restart keeps `CR_CANCEL_MSG`, since
+a freeze is no restart and the session should not be told it was one. The handoff phrase always
 follows the freeze message, because the freeze is only complete with a verified
 handoff.
 
@@ -90,7 +94,9 @@ typed once the reset has come, instead of `continue`. A limit that lifts before
 the window's reset keeps the session held until the reset.
 
 A freeze that fails (the handoff is never written, or the unfold never reaches
-the session) is called off and said so in the badge and log. It is not retried
+the session) is called off and said so in the badge and log. If the session had
+seen the freeze phrase, it is also told the freeze is off, with
+`CR_BUDGET_CANCEL_MSG`; if not, nothing more is typed. A freeze is not retried
 in the same window; the existing limit wait then takes over if the limit is hit.
 
 ## The forecast file
@@ -130,6 +136,7 @@ means *freeze*. The wrapper does not know or care who reads the file.
 | `CR_BUDGET_FREEZE_MIN` | `5` | freeze when the target is this many minutes away |
 | `CR_BUDGET_SLOW_MSG` | see above | the slow message |
 | `CR_BUDGET_FREEZE_MSG` | see above | the freeze message, before the handoff phrase |
+| `CR_BUDGET_CANCEL_MSG` | see above | the phrase that calls off a freeze the session had seen |
 
 The resume waits for the reset plus `CR_MARGIN_SEC`, as a usage limit does; the
 handoff uses `CR_HANDOFF_MSG`, `CR_HANDOFF_FILE`, `CR_RESUME_MSG` and their

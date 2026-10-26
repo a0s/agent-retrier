@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -589,6 +590,23 @@ class TestTheFreezeIsTheRestartsOwn(BudgetCase):
         self.step(ctl, RESET + 45)
         self.assertEqual(self.injected()[-1], ctl.resume_text)
 
+    def test_an_aborted_freeze_types_its_own_cancel_phrase(self):
+        # The session has seen the freeze phrase, so an abort must call it off, and
+        # in the budget's words: a freeze is no context restart (T35).
+        ctl = paced()
+        self.to_slow(ctl)
+        self.to_freeze(ctl)                    # the freeze phrase goes out at t=20
+        ctl.on_handoff_echo(tc.MINE, 21)       # ...and the session has seen it
+        for t in (500, 920, 921):              # 900 s for the handoff, then the abort
+            self.step(ctl, t)
+        self.assertEqual(self.injected().count(ctl.budget_cancel_text), 1, self.injected())
+        self.assertEqual(ctl.budget_cancel_text, cr.BUDGET_CANCEL_MSG_DEFAULT)
+        self.assertNotIn(ctl.cancel_text, self.injected())
+        self.assertEqual(ctl.inject_note(),
+                         "session budget: freeze cancelled; asking the session to carry on")
+        self.step(ctl, 922)                    # the cancel is closed out one tick later
+        self.assertIsNone(ctl.rstate)
+
     def test_a_handoff_that_never_lands_aborts_the_freeze_and_says_so(self):
         ctl = paced()
         self.to_slow(ctl)
@@ -626,7 +644,42 @@ class TestTheFreezeIsTheRestartsOwn(BudgetCase):
         self.assertEqual(self.injected().count(ctl.resume_text), 1)
 
 
+class TestAnAbortedRestartSaysWhichItWas(BudgetCase):
+    def test_a_context_restart_that_aborts_still_types_the_restart_cancel(self):
+        ctl = tc.restart_controller(budget_cancel_msg="BUDGET CANCEL")
+        tc.usage(ctl, 0, tc.FULL)
+        action = self.step(ctl, 30)
+        self.assertEqual(action[0], "inject")  # the fold phrase
+        ctl.on_handoff_echo(tc.MINE, 30)       # the session has seen it
+        for t in (60, 500, 929, 930, 931):     # 900 s for the handoff, then the abort
+            self.step(ctl, t)
+        self.assertIn(ctl.cancel_text, self.injected())
+        self.assertNotIn("BUDGET CANCEL", self.injected())
+
+
 class TestTheOverridesReplaceTheDefaults(BudgetCase):
+    def test_the_bash_defaults_say_what_the_python_defaults_say(self):
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "agent-retrier.sh")
+        out = subprocess.run(
+            ["bash", "-c",
+             'set -u; eval "$(sed -n "/^CR_BUDGET_[A-Z_]*_DEFAULT=/p" "$1")"; '
+             'printf "%s\\0%s\\0%s" "$CR_BUDGET_SLOW_MSG_DEFAULT" '
+             '"$CR_BUDGET_FREEZE_MSG_DEFAULT" "$CR_BUDGET_CANCEL_MSG_DEFAULT"',
+             "_", script],
+            capture_output=True, text=True, check=True).stdout
+        slow, freeze, cancel = out.split("\0")
+        self.assertEqual(slow, cr.BUDGET_SLOW_MSG_DEFAULT)
+        self.assertEqual(freeze, cr.BUDGET_FREEZE_MSG_DEFAULT)
+        self.assertEqual(cancel, cr.BUDGET_CANCEL_MSG_DEFAULT)
+
+    def test_the_cancel_wording_is_read_from_the_environment(self):
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        mod = helper.load(CR_BUDGET_CANCEL_MSG="Budget freeze off.")
+        self.assertEqual(mod.CFG["budget_cancel_msg"], "Budget freeze off.")
+        self.assertEqual(helper.load().CFG["budget_cancel_msg"], helper.load().BUDGET_CANCEL_MSG_DEFAULT)
+
     def test_the_environment_wording_is_what_gets_typed(self):
         saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
