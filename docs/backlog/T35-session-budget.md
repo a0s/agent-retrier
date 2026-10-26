@@ -1,6 +1,6 @@
 # T35 — Session budget: pace the 5-hour limit instead of hitting it
 
-Priority: P1 · Epic: limits · Depends on: T20 (statusline proxy) · Size: L · Status: open
+Priority: P1 · Epic: limits · Depends on: T20 (statusline proxy) · Size: L · Status: done (unreleased)
 
 ## Problem
 
@@ -76,13 +76,13 @@ Opt-in, claude only (codex: out of scope, note it in the docs). Off unless
 
 ## Acceptance criteria
 
-- [ ] AC1 With `CR_SESSION_BUDGET` unset, behaviour is unchanged: `./test/run.sh` passes and a test asserts no budget messages and no forecast file.
-- [ ] AC2 Unit tests (new `test/test_budget.py`): fit over synthetic samples gives the expected rate; state ok/slow/freeze at the boundaries; `max_agents` formula; samples from an older `resets_at` are dropped; token calibration fills between statusline samples.
-- [ ] AC3 Controller test with `fake_claude.py`: statusline samples drive `ok→slow` → the slow message is typed exactly once with placeholders filled; then `→freeze` → the freeze message (contains the handoff phrase with `{file}`) is typed once; after the marker and the reset the resume phrase is typed once.
-- [ ] AC4 Overrides `CR_BUDGET_SLOW_MSG`/`CR_BUDGET_FREEZE_MSG` replace the defaults (test).
-- [ ] AC5 Forecast file: written atomically, valid JSON with every schema v1 key; not written without `CR_FORECAST_FILE` (test).
-- [ ] AC6 No typing over a user draft (reuse of the existing gate; test).
-- [ ] AC7 `./test/run.sh` passes in full; `./test/codegraph-sync.sh` run; `docs/session-budget.md`, `docs/configuration.md`, README, CHANGELOG updated; `--cr-version` prints 3.1.0.
+- [x] AC1 With `CR_SESSION_BUDGET` unset, behaviour is unchanged: `./test/run.sh` passes and a test asserts no budget messages and no forecast file.
+- [x] AC2 Unit tests (new `test/test_budget.py`): fit over synthetic samples gives the expected rate; state ok/slow/freeze at the boundaries; `max_agents` formula; samples from an older `resets_at` are dropped; token calibration fills between statusline samples.
+- [x] AC3 Controller test with `fake_claude.py`: statusline samples drive `ok→slow` → the slow message is typed exactly once with placeholders filled; then `→freeze` → the freeze message (contains the handoff phrase with `{file}`) is typed once; after the marker and the reset the resume phrase is typed once.
+- [x] AC4 Overrides `CR_BUDGET_SLOW_MSG`/`CR_BUDGET_FREEZE_MSG` replace the defaults (test).
+- [x] AC5 Forecast file: written atomically, valid JSON with every schema v1 key; not written without `CR_FORECAST_FILE` (test).
+- [x] AC6 No typing over a user draft (reuse of the existing gate; test).
+- [x] AC7 `./test/run.sh` passes in full; `./test/codegraph-sync.sh` run; `docs/session-budget.md`, `docs/configuration.md`, README, CHANGELOG updated; `--cr-version` prints 3.1.0.
 
 ## Where in the code
 
