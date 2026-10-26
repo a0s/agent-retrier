@@ -159,6 +159,7 @@ deliberately spends quota, and which nothing else depends on.
 | [T32](T32-session-not-yet-named.md) | A session that is not named yet is not guessed at | P0 | A |
 | [T33](T33-attach-and-roster-identity.md) | `claude attach` is its job's session, and the roster is nobody's | P0 | A |
 | [T34](T34-codex-session-named-by-its-log.md) | A codex session is named by codex's own log | P0 | A |
+| [T35](T35-session-budget.md) | Session budget: pace the 5-hour limit instead of hitting it | P1 | limits |
 
 Epics: A — session identity; B — restart-machine guarantees; C — models and
 windows; D — per-agent commands and input; E — miscellaneous; F — subagent

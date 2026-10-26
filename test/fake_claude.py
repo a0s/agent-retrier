@@ -100,6 +100,11 @@ see whatever the proxy chained through to the user's own statusline:
   FAKE_STATUSLINE_DELAY   seconds to wait first (default 0.5): the wrapper
                           seeds its own pollers before this runs, the same
                           reasoning as FAKE_USAGE_DELAY above
+
+For T35 (the session budget) a line typed as `statusline <percent>` runs the
+same command once more, with claude's `rate_limits` in the payload: the
+five-hour window's used percentage, at a reset FAKE_STATUS_RESETS_IN seconds
+after the fake started (default 18000), and a seven-day one.
 """
 import json
 import os
@@ -115,6 +120,7 @@ _MARKER = re.compile(r"must be exactly (\S+) and nothing else")
 _TARGET = re.compile(r"handoff to `([^`]+)`")
 
 SESSION = ["fake-session"]
+RESETS_AT = [0]      # the five-hour window's reset, as the statusline states it (T35)
 STARTED_AT = [None]
 DROP_NEXT_FOLD = [False]
 CWD = [None]          # whose project the transcript is under: ours, or an attached job's
@@ -462,6 +468,17 @@ def maybe_run_statusline():
     """
     if not os.environ.get("FAKE_STATUSLINE_RUN"):
         return
+    time.sleep(float(os.environ.get("FAKE_STATUSLINE_DELAY", "0.5")))
+    run_statusline()
+
+
+def run_statusline(percent=None):
+    """One refresh of claude's statusline: the statusLine command named by
+    `--settings`, run once, stdin fed the payload the FAKE_STATUS_* knobs
+    describe, stdout printed onto the screen. With `percent` (T35) the payload
+    also carries claude's `rate_limits`: the five-hour window's used percentage
+    at a fixed `resets_at` (FAKE_STATUS_RESETS_IN seconds after this process
+    started), and a seven-day one."""
     settings = None
     argv = sys.argv[1:]
     for i, a in enumerate(argv):
@@ -479,7 +496,6 @@ def maybe_run_statusline():
     command = status_line.get("command")
     if not command or status_line.get("type", "command") != "command":
         return
-    time.sleep(float(os.environ.get("FAKE_STATUSLINE_DELAY", "0.5")))
     payload = {
         "model": {"id": os.environ.get("FAKE_STATUS_MODEL", "claude-sonnet-5")},
         "context_window": {
@@ -488,6 +504,10 @@ def maybe_run_statusline():
         "transcript_path": transcript_path(),
         "workspace": {"current_dir": os.getcwd(), "project_dir": os.getcwd()},
     }
+    if percent is not None:
+        payload["rate_limits"] = {
+            "five_hour": {"used_percentage": percent, "resets_at": RESETS_AT[0]},
+            "seven_day": {"used_percentage": 40.1, "resets_at": RESETS_AT[0] + 86400}}
     try:
         result = subprocess.run(command, shell=True, input=json.dumps(payload),
                                 text=True, capture_output=True, timeout=10)
@@ -525,6 +545,7 @@ def main():
     out = sys.stdout
     STARTED_AT[0] = int(time.time() * 1000)
     SESSION[0] = "fake-session-%d" % os.getpid()  # distinct per process, like a real sessionId
+    RESETS_AT[0] = int(time.time()) + int(os.environ.get("FAKE_STATUS_RESETS_IN", "18000"))
     out.write("fake-claude ready argv=%s\r\n" % " ".join(sys.argv[1:]))
     try:
         cols, rows = os.get_terminal_size()   # os.terminal_size is (columns, lines)
@@ -643,6 +664,13 @@ def main():
             if line == "answer":
                 write_transcript("an ordinary answer", limited=False)
                 out.write("GOT:answer\r\n")
+                out.flush()
+                continue
+            if line.startswith("statusline "):
+                # T35: one statusline refresh, as Claude Code draws one after a
+                # turn, with the five-hour percentage the line names.
+                run_statusline(float(line.split()[1]))
+                out.write("GOT:statusline\r\n")
                 out.flush()
                 continue
             if line == "winsize":

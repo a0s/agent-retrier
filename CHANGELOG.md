@@ -7,6 +7,19 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.1.0] - unreleased
+
+### Added
+- The session budget (`CR_SESSION_BUDGET`, claude only): the wrapper paces the
+  5-hour limit from claude's own statusline, instead of waiting for it to be
+  hit. Nearing the target it asks the session to start no more agents than the
+  pace allows; at the target it freezes the session into a handoff, the one a
+  context restart writes, and unfolds it when the window resets. A freeze
+  happens once per window. `CR_FORECAST_FILE` writes the forecast (schema 1)
+  for other tools. Off unless the setting is a percentage, and nothing changes
+  without it. See docs/session-budget.md.
+- The statusline proxy records claude's five-hour and seven-day usage figures.
+
 ## [3.0.5] - 2026-10-14
 
 ### Fixed

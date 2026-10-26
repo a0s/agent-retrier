@@ -127,6 +127,10 @@ catches up with the current codex-cli's TUI.
   goes back to watching. → [usage limits](docs/usage-limits.md#when-a-limit-lifts-early)
 - **Nudges a turn the server refused** (`Selected model is at capacity`), with a
   wait that doubles on each repeat. → [stalls](docs/stalls.md)
+- **Paces the 5-hour limit.** With `CR_SESSION_BUDGET` set, it asks a session
+  to start no more agents than the pace allows as the limit nears, and at the
+  target freezes it into a handoff and unfolds it at the reset.
+  → [session budget](docs/session-budget.md)
 - **Restarts a session that is filling its context window**: handoff file,
   verified, `/clear`, fresh session reads it. Off until you switch it on.
   → [context restart](docs/context-restart.md)
@@ -178,6 +182,7 @@ pretending they are the same:
 | [Context restart](docs/context-restart.md) | turning it on, what you see, the design, custom phrases, choosing a threshold, when nothing happens |
 | [codex](docs/codex.md) | `agent-retrier-codex`, rollouts, subcommands, codex context thresholds, staying ahead of its compaction |
 | [Usage limits](docs/usage-limits.md) | waiting out a limit, early lifts, how a limit is detected, resuming a session |
+| [Session budget](docs/session-budget.md) | pacing the 5-hour limit: the slow and freeze messages, the forecast file |
 | [Stalls](docs/stalls.md) | refused turns and the capacity nudge |
 | [Custom command](docs/custom-command.md) | `--cmd`, `CR_CLAUDE_CMD`, aliases and functions |
 | [How it works](docs/how-it-works.md) | the pty, transcripts, the badge, update checks, requirements, tests |
