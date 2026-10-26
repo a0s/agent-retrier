@@ -80,7 +80,7 @@
 
 set -u
 
-CR_VERSION="3.0.5"
+CR_VERSION="3.1.0"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.
@@ -462,6 +462,20 @@ CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 # substituted, same as above, though this phrase has no need of it.
 CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not needed now. Continue with what you were doing before it was requested.'
 : "${CR_CANCEL_MSG:=$CR_CANCEL_MSG_DEFAULT}"
+# T35: pacing the 5-hour limit (claude only; see docs/session-budget.md). Off
+# unless CR_SESSION_BUDGET is a percentage. Nearing it, the session is asked to
+# start no more agents than the pace allows; at the target it is frozen into a
+# handoff (the same one a context restart writes) and unfolded at the reset.
+# CR_FORECAST_FILE, when set, is where the forecast is written for other tools.
+: "${CR_SESSION_BUDGET:=}"             # target percent of the 5-hour limit; empty or 0 = off
+: "${CR_FORECAST_FILE:=}"              # the forecast, schema v1; unset = no file
+: "${CR_BUDGET_WINDOW_SEC:=600}"       # look-back of the pace fit
+: "${CR_BUDGET_FREEZE_MIN:=5}"         # freeze when the target is this many minutes away
+CR_BUDGET_SLOW_MSG_DEFAULT='Session budget: {percent}% of the 5-hour limit used, pace {rate}%/min, forecast {forecast}% at the reset ({resets}); target {target}%. Reduce parallel work to at most {agents} agents: start no new ones until the pace drops.'
+: "${CR_BUDGET_SLOW_MSG:=$CR_BUDGET_SLOW_MSG_DEFAULT}"
+# The handoff phrase follows this one, so the trailing space is part of it.
+CR_BUDGET_FREEZE_MSG_DEFAULT='Session budget: the {target}% target will be reached in about {minutes} min (reset at {resets}). Start no new agents and stop the running ones at a safe point. '
+: "${CR_BUDGET_FREEZE_MSG:=$CR_BUDGET_FREEZE_MSG_DEFAULT}"
 # claude and codex do not speak the same commands, so a phrase that names one —
 # a slash command, a skill, a custom prompt — cannot be shared between them.
 # CR_CLAUDE_<X>/CR_CODEX_<X> override CR_<X> for one agent only; unset (the
@@ -902,6 +916,27 @@ def _env_positive(name, default):
     return v if 0 < v < float("inf") else default
 
 
+def _budget_target(text):
+    """CR_SESSION_BUDGET: a percentage of the 5-hour limit, or None (off). Empty,
+    zero, unparsable and anything past 100 all mean off (T35)."""
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        return None
+    return v if 0 < v <= 100 else None
+
+
+# The session budget's phrases (T35). Bash sets the same text as CR_BUDGET_*_MSG
+# defaults; these cover a run started without bash, the tests included.
+BUDGET_SLOW_MSG_DEFAULT = (
+    "Session budget: {percent}% of the 5-hour limit used, pace {rate}%/min, "
+    "forecast {forecast}% at the reset ({resets}); target {target}%. Reduce "
+    "parallel work to at most {agents} agents: start no new ones until the pace drops.")
+BUDGET_FREEZE_MSG_DEFAULT = (
+    "Session budget: the {target}% target will be reached in about {minutes} min "
+    "(reset at {resets}). Start no new agents and stop the running ones at a safe point. ")
+
+
 # No single number is "the" community consensus — recommendations run 40-70%,
 # with "around 60%" and "half the window" both common — but 51% is what this
 # project's own docs have suggested from the start and what every claude
@@ -1022,6 +1057,13 @@ CFG = dict(
     # -- claude's own statusline, relayed by --cr-statusline (T20) --
     statusline_proxy=_env("CR_STATUSLINE_PROXY", "1") == "1",
     status_dir=_env("CR_STATUS_DIR", os.path.expanduser("~/.agent-retrier/status")),
+    # -- the session budget (T35): claude only, off unless a percentage is set --
+    session_budget=_budget_target(os.environ.get("CR_SESSION_BUDGET")),
+    forecast_file=_env("CR_FORECAST_FILE", ""),
+    budget_window_sec=_env_positive("CR_BUDGET_WINDOW_SEC", 600.0),
+    budget_freeze_min=max(0.0, _env("CR_BUDGET_FREEZE_MIN", 5.0, float)),
+    budget_slow_msg=_env("CR_BUDGET_SLOW_MSG", BUDGET_SLOW_MSG_DEFAULT),
+    budget_freeze_msg=_env("CR_BUDGET_FREEZE_MSG", BUDGET_FREEZE_MSG_DEFAULT),
     # -- the copies of this program older versions left in $TMPDIR --
     tmp_sweep=_env("CR_TMP_SWEEP", "1") == "1",
 )
@@ -3362,8 +3404,9 @@ def claude_launch_args(cfg, agent, argv, pid=None):
     """
     if agent != "claude" or not cfg.get("statusline_proxy", True):
         return []
-    if cfg.get("context_tokens", 0) <= 0 and not cfg.get("context_restart_on"):
-        return []                    # nothing needs the window signal yet
+    if (cfg.get("context_tokens", 0) <= 0 and not cfg.get("context_restart_on")
+            and not cfg.get("session_budget")):
+        return []                    # nothing needs the window signal yet (T35: nor the pace)
     if any(a == "--settings" or a.startswith("--settings=") for a in (argv or [])):
         return []                    # the user's own flag always wins
     if is_attach_launch(argv):
@@ -4154,10 +4197,15 @@ HANDOFF_SENT, HANDOFF_OK, CLEAR_SENT, CLEARED, RESUME_SENT, UNFOLD_FAILED = (
 # already reached the session cannot just walk away like an ordinary abort --
 # it has one more thing to say before the restart is actually over.
 CANCEL_PENDING = "cancel_pending"
+# The session budget's freeze (T35) reuses the restart's handoff and unfold, and
+# nothing is cleared in it: the handoff is on disk, the session is held here
+# until its 5-hour window resets, and only then is it unfolded.
+FROZEN = "frozen"
 
 RESTART_LABELS = {HANDOFF_SENT: "folding", HANDOFF_OK: "folded",
                   CLEAR_SENT: "clearing", CLEARED: "cleared", RESUME_SENT: "unfolding",
-                  UNFOLD_FAILED: "unfold failed", CANCEL_PENDING: "cancelling"}
+                  UNFOLD_FAILED: "unfold failed", CANCEL_PENDING: "cancelling",
+                  FROZEN: "frozen to reset"}
 
 # Defaults for everything the context restart and the stall handling read, so a
 # Controller built from a config dict written before either existed (the tests
@@ -4177,7 +4225,268 @@ CONTEXT_DEFAULTS = dict(
     model_lookup=False, model_lookup_timeout=10.0,
     model_cache=os.path.expanduser("~/.agent-retrier/windows.json"),
     model_cache_ttl=604800.0, models_doc_url="", models_api_url="",
+    session_budget=None, budget_window_sec=600.0, budget_freeze_min=5.0,
+    forecast_file="", budget_slow_msg=BUDGET_SLOW_MSG_DEFAULT,
+    budget_freeze_msg=BUDGET_FREEZE_MSG_DEFAULT,
 )
+
+
+# --------------------------------------------------------------------------- #
+# the session budget (T35): pace of the 5-hour limit
+# --------------------------------------------------------------------------- #
+# Claude Code states how much of the 5-hour limit is used (`rate_limits` in its
+# statusline JSON), but only when it draws the statusline, so between two of its
+# updates the percent is estimated from the weighted tokens of the session and of
+# its subagents, with a percent-per-token ratio calibrated from the last pair of
+# statusline samples that moved. The pace is a least-squares line over the last
+# CR_BUDGET_WINDOW_SEC; the forecast is where that line stands at the reset.
+BUDGET_WEIGHTS = (("output_tokens", 5.0), ("input_tokens", 1.0),
+                  ("cache_creation_input_tokens", 1.25), ("cache_read_input_tokens", 0.1))
+SUBAGENT_ACTIVE_SEC = 120.0     # a subagent transcript written this recently is running
+FORECAST_SCHEMA = 1
+FORECAST_KEYS = ("v", "agent", "session", "updated_at", "percent", "rate_per_min",
+                 "resets_at", "forecast_at_reset", "minutes_to_target", "target", "state",
+                 "max_agents", "active_agents", "seven_day_percent")
+
+
+def _finite(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and x - x == 0
+
+
+def weighted_usage(usage):
+    """One usage block as weighted tokens (T35): output 5, input 1, cache writes
+    1.25, cache reads 0.1. A block that does not say is worth nothing."""
+    if not isinstance(usage, dict):
+        return 0.0
+    total = 0.0
+    for key, weight in BUDGET_WEIGHTS:
+        n = usage.get(key)
+        if _finite(n):
+            total += weight * n
+    return total
+
+
+def budget_read(path, offset, seen):
+    """(new_offset, weighted tokens of the assistant messages added past `offset`).
+
+    A message is written as one row per content block, each carrying the same
+    usage, so `seen` (the message ids already counted) keeps it to one count. A
+    "<synthetic>" row is no usage at all (T10).
+    """
+    offset, rows = _appended(path, offset)
+    total = 0.0
+    for raw in rows:
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+        model = msg.get("model")
+        if isinstance(model, str) and model.startswith("<"):
+            continue
+        mid = msg.get("id")
+        if mid is not None:
+            if mid in seen:
+                continue
+            seen.add(mid)
+        total += weighted_usage(msg.get("usage"))
+    return offset, total
+
+
+class SessionBudget:
+    """The pace of the 5-hour limit, fitted from statusline samples (T35).
+
+    Samples are `(time, percent, resets_at)` from claude's statusline. Only the
+    samples of the window being paced count: one that names an older `resets_at`
+    is dropped, and a newer one starts that window afresh. `points` is what the
+    pace is fitted to: the samples, and an estimate after each read of the
+    transcripts that moved the percent on from the last sample.
+    """
+
+    def __init__(self, target, window_sec=600.0, freeze_min=5.0, log=None):
+        self.target = float(target)
+        self.window_sec = float(window_sec)
+        self.freeze_min = float(freeze_min)
+        self.log = log or (lambda *_: None)
+        self.resets_at = None      # the 5-hour window the samples belong to
+        self.seven_day = None      # the 7-day percent as of the newest sample
+        self.points = []           # (t, percent)
+        self.anchor = None         # (percent, weighted tokens) of the newest sample
+        self.ratio = None          # percent per weighted token, the last good pair's
+        self.weighted = 0.0        # weighted tokens read so far, all transcripts together
+        self.offsets = {}          # transcript path -> bytes read
+        self.seen = set()          # message ids already counted
+        self.since = None          # when the first read happened (the agent had started)
+        self.active_agents = 0     # subagent transcripts written in the last two minutes
+
+    def on_sample(self, t, percent, resets_at, seven_day=None):
+        """One statusline report: `five_hour.used_percentage` at `resets_at`.
+
+        Returns False, and changes nothing, for a report of an older window or
+        one with no numbers in it.
+        """
+        if not _finite(percent) or not _finite(resets_at):
+            return False
+        if self.resets_at is not None and resets_at < self.resets_at:
+            return False
+        if resets_at != self.resets_at:
+            self.resets_at = resets_at
+            self.points = []
+            self.anchor = None
+        if self.anchor is not None:
+            p0, w0 = self.anchor
+            if percent > p0 and self.weighted > w0:
+                self.ratio = (percent - p0) / (self.weighted - w0)
+        self.anchor = (float(percent), self.weighted)
+        self.seven_day = seven_day if _finite(seven_day) else None
+        self._add_point(t, float(percent))
+        return True
+
+    def add_usage(self, t, weighted):
+        """Weighted tokens that appeared at `t`. Between two statusline samples
+        they move the percent by the calibrated ratio, if there is one."""
+        if weighted <= 0:
+            return
+        self.weighted += weighted
+        if self.anchor is not None and self.ratio is not None:
+            self._add_point(t, self._estimate())
+
+    def read(self, now, transcript=None, subagent_dir=None):
+        """Counts what the session and its subagents wrote since the last read.
+
+        A transcript met for the first time is taken from where it stands, so the
+        history of a session that was already there is not counted; a subagent
+        met for the first time counts from its start only if it was written after
+        the first read, the same rule.
+        """
+        if self.since is None:
+            self.since = now
+        subagents = []
+        if subagent_dir:
+            subagents = sorted(glob.glob(os.path.join(subagent_dir, "agent-*.jsonl")))
+        self.active_agents = 0
+        for path in subagents:
+            try:
+                if os.path.getmtime(path) >= now - SUBAGENT_ACTIVE_SEC:
+                    self.active_agents += 1
+            except OSError:
+                pass
+        added = 0.0
+        for path in ([transcript] if transcript else []) + subagents:
+            if path not in self.offsets:
+                start = _size(path)
+                if path != transcript:
+                    try:
+                        if os.path.getmtime(path) >= self.since:
+                            start = 0
+                    except OSError:
+                        pass
+                self.offsets[path] = start
+            self.offsets[path], got = budget_read(path, self.offsets[path], self.seen)
+            added += got
+        self.add_usage(now, added)
+
+    def snapshot(self, now):
+        """The forecast as of `now`, or None while the window is not known, has no
+        sample, or is over (its next sample will say so)."""
+        if self.resets_at is None or self.anchor is None:
+            return None
+        minutes_to_reset = (self.resets_at - now) / 60.0
+        if minutes_to_reset <= 0:
+            return None
+        percent = self._estimate()
+        target = self.target
+        rate = self._rate(now)
+        minutes_to_target = None
+        if percent >= target:
+            minutes_to_target = 0.0
+        elif rate is not None and rate > 0:
+            minutes_to_target = (target - percent) / rate
+        forecast = None
+        max_agents = None
+        if rate is not None:
+            forecast = percent + rate * minutes_to_reset
+            if rate > 0:
+                safe_rate = max(0.0, target - percent) / minutes_to_reset
+                max_agents = max(0, int(max(self.active_agents, 1) * safe_rate / rate))
+        if percent >= target or (minutes_to_target is not None
+                                 and minutes_to_target < self.freeze_min):
+            state = "freeze"
+        elif forecast is not None and forecast > target:
+            state = "slow"
+        else:
+            state = "ok"
+        return dict(state=state, percent=percent, rate=rate, forecast_at_reset=forecast,
+                    minutes_to_target=minutes_to_target, minutes_to_reset=minutes_to_reset,
+                    max_agents=max_agents, active_agents=self.active_agents,
+                    resets_at=self.resets_at, target=target, seven_day_percent=self.seven_day)
+
+    def _estimate(self):
+        p0, w0 = self.anchor
+        if self.ratio is None:
+            return p0
+        return p0 + self.ratio * max(0.0, self.weighted - w0)
+
+    def _add_point(self, t, percent):
+        self.points.append((t, percent))
+        cut = t - self.window_sec
+        if self.points[0][0] < cut:
+            self.points = [pt for pt in self.points if pt[0] >= cut]
+
+    def _rate(self, now):
+        """The least-squares slope of the points in the window, in percent a minute,
+        or None with fewer than two points (or no spread in time to fit)."""
+        cut = now - self.window_sec
+        pts = [pt for pt in self.points if pt[0] >= cut]
+        n = len(pts)
+        if n < 2:
+            return None
+        mean_t = sum(t for t, _ in pts) / n
+        mean_p = sum(p for _, p in pts) / n
+        sxx = sum((t - mean_t) ** 2 for t, _ in pts)
+        if sxx <= 0:
+            return None
+        sxy = sum((t - mean_t) * (p - mean_p) for t, p in pts)
+        return 60.0 * sxy / sxx
+
+
+def forecast_record(fc, now, agent, session):
+    """The forecast file's record, schema v1 (T35; docs/session-budget.md)."""
+    def r(x):
+        return None if x is None else round(x, 2)
+    return dict(v=FORECAST_SCHEMA, agent=agent, session=session, updated_at=int(now),
+                percent=r(fc["percent"]), rate_per_min=r(fc["rate"]),
+                resets_at=fc["resets_at"], forecast_at_reset=r(fc["forecast_at_reset"]),
+                minutes_to_target=r(fc["minutes_to_target"]), target=fc["target"],
+                state=fc["state"], max_agents=fc["max_agents"],
+                active_agents=fc["active_agents"], seven_day_percent=r(fc["seven_day_percent"]))
+
+
+def write_forecast(path, record):
+    """The forecast file, written whole or not at all: a temp file next to it, then
+    a rename, so a reader never sees half of one (T35). False when it could not be."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w") as fh:
+            json.dump(record, fh)
+        os.rename(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 class HandoffRegistry:
@@ -4405,6 +4714,26 @@ class Controller:
         self._window_bumped = False
         self._cancel_sent = False     # CANCEL_PENDING: the phrase already went out,
                                        # this tick only closes the restart out (T09)
+
+        # -- the session budget (T35) -------------------------------------- #
+        # claude only: codex has no statusline to report its limit in.
+        self.budget = None
+        if cfg.get("session_budget") and not self.codex:
+            self.budget = SessionBudget(cfg["session_budget"],
+                                        window_sec=cfg.get("budget_window_sec", 600.0),
+                                        freeze_min=cfg.get("budget_freeze_min", 5.0),
+                                        log=self.log)
+        self.budget_forecast = None      # the last forecast (SessionBudget.snapshot)
+        self._budget_next = 0.0          # when the usage was last read
+        self._budget_state = "ok"        # the state the log last recorded
+        self._budget_slow_sent = None    # max_agents at the last slow message; None = none since ok
+        self._budget_held = None         # why a budget message waits, said once
+        self._budget_wake = 0.0          # the earliest a budget message may be typed
+        self._budget_frozen_for = None   # the window (resets_at) already frozen for
+        self._budget_freeze = False      # a freeze is in flight, on the restart machine
+        self._budget_prefix = ""         # the freeze message, typed before the handoff phrase
+        self._budget_resets_at = None    # when a frozen session may be unfolded
+        self._budget_note = None         # what inject_note says about the next budget message
 
     # -- inputs ------------------------------------------------------------- #
     # Not everything arriving on our stdin was typed. The terminal answers
@@ -4808,6 +5137,10 @@ class Controller:
         action = self._tick_restart(now)
         if action is not None:
             return action
+        if self.rstate is None:
+            action = self._tick_budget(now)
+            if action is not None:
+                return action
         return self._tick_limit(now)
 
     def _tick_limit(self, now):
@@ -5366,6 +5699,139 @@ class Controller:
         session_id = rec.get("session_id")
         if session_id:
             self.status_session_id = session_id
+        if self.budget is not None and rec.get("five_hour_percent") is not None:
+            # The sample is dated when the statusline was drawn, not when it was read.
+            at = rec.get("at")
+            t = at if _finite(at) else (now if now is not None else time.time())
+            self.budget.on_sample(t, rec.get("five_hour_percent"),
+                                  rec.get("five_hour_resets_at"),
+                                  rec.get("seven_day_percent"))
+
+    # -- the session budget (T35) ------------------------------------------- #
+    def budget_poll(self, now):
+        """Reads what the session has written, recomputes the forecast and, with
+        CR_FORECAST_FILE set, writes it. Called on every pass of the loop, but the
+        work is done at most every CR_POLL_SEC; the file is rewritten each time the
+        forecast is recomputed, while there is one (T35)."""
+        if self.budget is None or now < self._budget_next:
+            return
+        self._budget_next = now + self.cfg.get("poll", 2.0)
+        transcript = self.context_path
+        subagents = (os.path.splitext(transcript)[0] + os.sep + "subagents"
+                     if transcript else None)
+        self.budget.read(now, transcript, subagents)
+        fc = self.budget.snapshot(now)
+        self.budget_forecast = fc
+        if fc is None:
+            return
+        if fc["state"] != self._budget_state:
+            self.log("budget: %s→%s %.1f%% %s%%/min forecast %s%%"
+                     % (self._budget_state, fc["state"], fc["percent"],
+                        "n/a" if fc["rate"] is None else "%.2f" % fc["rate"],
+                        "n/a" if fc["forecast_at_reset"] is None
+                        else "%.0f" % fc["forecast_at_reset"]))
+            self._budget_state = fc["state"]
+        if self.cfg.get("forecast_file"):
+            write_forecast(self.cfg["forecast_file"],
+                           forecast_record(fc, now, "claude", self._budget_session()))
+
+    def _budget_session(self):
+        """The session the forecast is about: claude's own id as its statusline
+        names it, else the transcript's, else this wrapper's."""
+        if self.status_session_id:
+            return self.status_session_id
+        if self.context_path:
+            return os.path.splitext(os.path.basename(self.context_path))[0]
+        return self.session_id
+
+    def _tick_budget(self, now):
+        """A budget message, when one is due and may be typed (T35).
+
+        Slow: once, when the pace says the target would be overrun by the reset;
+        again only after the pace went back to ok, or the number of agents it
+        allows has at least halved. Freeze: once per 5-hour window, through the
+        restart's own handoff. Nothing is typed over a draft, into a turn still
+        running, or while a restart or a limit is in flight.
+        """
+        fc = self.budget_forecast
+        if (self.budget is None or fc is None or self.hands_off
+                or self.state != IDLE or self.rstate is not None):
+            return None
+        if fc["state"] == "ok":
+            self._budget_slow_sent = None      # back under: the next slow message is news
+            return None
+        if now < self._budget_wake:
+            return None
+        if fc["state"] == "freeze":
+            if self._budget_frozen_for == fc["resets_at"]:
+                return None
+        elif self._budget_slow_sent is not None:
+            sent, agents = self._budget_slow_sent, fc["max_agents"] or 0
+            if not (sent > 0 and agents * 2 <= sent):
+                return None
+        why = self._budget_gate(now)
+        if why:
+            return self._budget_hold(now, why)
+        if fc["state"] == "freeze":
+            return self._start_freeze(fc, now)
+        return self._send_slow(fc, now)
+
+    def _budget_gate(self, now):
+        """Why nothing may be typed for the budget now, or None: the gates a restart
+        step keeps -- a person typing, a draft in the box, a turn still running."""
+        return self._blocked_by_human(now) or self._session_busy(now) or None
+
+    def _budget_hold(self, now, why):
+        if why != self._budget_held:
+            self._budget_held = why
+            self.log("budget message held: %s" % why)
+        self._budget_wake = now + self.gate_retry
+        return None
+
+    def _render_budget(self, template, fc):
+        """A budget phrase with its placeholders filled in, on one line (T35)."""
+        def show(x, spec):
+            return "n/a" if x is None else spec % x
+        values = dict(
+            percent=show(fc["percent"], "%.1f"),
+            target="%g" % fc["target"],
+            rate=show(fc["rate"], "%.2f"),
+            forecast=show(fc["forecast_at_reset"], "%.0f"),
+            minutes=show(fc["minutes_to_target"] or 0.0, "%.0f"),
+            resets=time.strftime("%H:%M", time.localtime(fc["resets_at"])),
+            agents=show(fc["max_agents"], "%d"),
+            file=self.handoff_path)
+        text = template
+        for key, value in values.items():
+            text = text.replace("{%s}" % key, str(value))
+        return " ".join(text.split())
+
+    def _send_slow(self, fc, now):
+        text = expand_skill(self._render_budget(self.cfg["budget_slow_msg"], fc), "claude")
+        self._budget_slow_sent = fc["max_agents"] or 0
+        self._budget_held = None
+        self._budget_note = "session budget: the pace is over the target; asking for fewer agents"
+        self.log("budget: slow message typed (at most %d agents while the pace holds)"
+                 % (fc["max_agents"] or 0))
+        return ("inject", text, self._take_dismiss())
+
+    def _start_freeze(self, fc, now):
+        """The freeze: the freeze message, then the handoff phrase, through the same
+        restart machinery as a context restart. Once the handoff is accepted the
+        session waits for its window to reset, and only then is it unfolded (T35)."""
+        self._budget_frozen_for = fc["resets_at"]
+        self._budget_freeze = True
+        self._budget_held = None
+        self._budget_resets_at = fc["resets_at"]
+        message = expand_skill(self._render_budget(self.cfg["budget_freeze_msg"], fc), "claude")
+        self._budget_prefix = message + " " if message else ""
+        self.handoff_tries = 0
+        self.handoff_echo_retries = 0
+        self.resume_tries = 0
+        self.log("budget: freezing at %.1f%% (target %g%%); unfolding at the reset, %s"
+                 % (fc["percent"], fc["target"],
+                    time.strftime("%H:%M", time.localtime(fc["resets_at"]))))
+        return self._send_handoff(now, fresh=True)
 
     # -- codex's own compaction --------------------------------------------- #
     def interrupt_line(self):
@@ -5623,6 +6089,13 @@ class Controller:
 
     def inject_note(self):
         """The one line the human sees when something is typed for them."""
+        if self._budget_freeze and self.rstate == HANDOFF_SENT:
+            return "session budget: freezing; asking for a handoff"
+        if self._budget_freeze and self.rstate == RESUME_SENT:
+            return "session budget: reset reached; unfolding the handoff"
+        if self._budget_note and self.rstate is None:
+            note, self._budget_note = self._budget_note, None
+            return note
         return {
             HANDOFF_SENT: "context is filling up; asking for a handoff",
             CLEAR_SENT: "handoff verified; clearing the context",
@@ -5804,6 +6277,8 @@ class Controller:
             return self._check_clear(now)
         if self.rstate == CLEARED:
             return self._wait_for_unfold_gate(now)
+        if self.rstate == FROZEN:
+            return self._wait_for_budget_reset(now)
         if self.rstate == RESUME_SENT:
             return self._check_resume(now)
         if self.rstate == UNFOLD_FAILED:
@@ -5854,6 +6329,23 @@ class Controller:
         why = self._held(now, session_gate=self._cleared_by_hand)
         if why:
             return self._renotify(now, "context cleared; unfold is waiting for: %s" % why)
+        return self._send_resume(now)
+
+    def _enter_frozen(self, now):
+        """The freeze's handoff is accepted and the session is quiet: nothing is
+        cleared, so the session waits for its 5-hour window to reset, and the
+        margin a usage limit waits past is kept too (T35)."""
+        self.rstate = FROZEN
+        self.rwake = self._budget_resets_at + self.cfg.get("margin", 0.0)
+        self.log("budget: handoff written; holding the session until the reset at %s"
+                 % time.strftime("%H:%M", time.localtime(self._budget_resets_at)))
+        return None
+
+    def _wait_for_budget_reset(self, now):
+        """FROZEN: nothing is cleared and the handoff is on disk, so the only thing
+        to wait for is the reset, and then a person who is not typing (T35)."""
+        if now < self.rwake or self._held(now):
+            return None
         return self._send_resume(now)
 
     def _session_busy(self, now):
@@ -5967,7 +6459,8 @@ class Controller:
         self.end_turn_seen_at = 0.0
         self.handoff_verified_at = None   # a fresh nonce means a fresh proof, too
         self._handoff_verified_st = None
-        text = (self.cfg["handoff_msg"]
+        # The budget's freeze message comes first, when this is a freeze (T35).
+        text = (self._budget_prefix + self.cfg["handoff_msg"]
                 .replace("{file}", self.handoff_path)
                 .replace("{marker}", self.nonce))
         # A fresh nonce means a fresh phrase, so the proof that THIS one reached
@@ -5984,6 +6477,10 @@ class Controller:
     def _send_clear(self, now):
         if now < self.rwake or self._held(now):
             return None
+        if self._budget_freeze:
+            # A freeze clears nothing: the handoff is written, so the session waits
+            # for its window to reset instead (T35).
+            return self._enter_frozen(now)
         # The one irreversible step, and the only route to it is a handoff that
         # satisfied all four layers below. It is not, on its own, proof that
         # Claude Code actually acted on it -- CLEAR_SENT is what waits for that.
@@ -6254,7 +6751,28 @@ class Controller:
         return ("threshold leaves %s of working room; consider a larger CR_CONTEXT_TOKENS "
                 "or a bigger window" % human_tokens(headroom))
 
+    def _check_budget_resume(self, now):
+        """The unfold after a budget freeze. Nothing was cleared, so there is no
+        context to watch fall: the phrase either reached the session or it did not
+        (T35)."""
+        if self.resume_echoed:
+            self.log("budget: the resume phrase was accepted; the session carries on")
+            self._end_restart(now)
+            return None
+        if now < self.rwake or self._held(now):
+            return None
+        if self.resume_tries < self.cfg["resume_attempts"]:
+            self.resume_tries += 1
+            self.log("the resume phrase left no trace; sending it again (%d/%d)"
+                     % (self.resume_tries, self.cfg["resume_attempts"]))
+            return self._send_resume(now)
+        self._end_restart(now)
+        return ("notify", "budget: the resume phrase never reached the session; "
+                          "read `%s` yourself" % self.cfg["handoff_file"])
+
     def _check_resume(self, now):
+        if self._budget_freeze:
+            return self._check_budget_resume(now)
         if self._context_fell():
             note = ("context restarted: %s down to %s"
                     % (human_tokens(self.context_before), human_tokens(self.context_tokens)))
@@ -6319,11 +6837,16 @@ class Controller:
             self.log("the resume phrase had already landed; the ordinary retry fits")
             self._end_restart(now)
             return False, None
+        if self.rstate == FROZEN:
+            # The reset is the clock here too: a limit that lifts before it leaves
+            # the session held, and one that lifts after it unfolds (T35).
+            return True, self._tick_restart(now)
         self.rwake = 0.0
         return True, self._tick_restart(now)
 
     # -- endings ------------------------------------------------------------ #
     def _end_restart(self, now):
+        freeze = self._budget_freeze
         self.rstate = None
         self.nonce = None
         self.rwake = 0.0
@@ -6340,7 +6863,11 @@ class Controller:
         self._fold_unproven = False
         self._unproven_path = None
         self._proof_wait_since = None
-        self.cooldown_until = now + self.cfg["context_cooldown"]
+        self._budget_freeze = False
+        self._budget_prefix = ""
+        self._budget_resets_at = None
+        if not freeze:                  # a freeze is not a restart: no cooldown after it (T35)
+            self.cooldown_until = now + self.cfg["context_cooldown"]
 
     def _abort_restart(self, why, now, permanent=False):
         """Stop, name the layer that failed, and leave the session exactly as it is.
@@ -6366,7 +6893,11 @@ class Controller:
             self._cancel_sent = False
             self.rwake = now
             return None
+        freeze = self._budget_freeze
         self._end_restart(now)
+        if freeze:
+            self.log("budget freeze aborted at %s: %s" % (at, why))
+            return ("notify", "budget freeze aborted: %s" % why)
         if permanent:
             self.context_off = True
             self._off_reason = why
@@ -7558,10 +8089,20 @@ def run_statusline_proxy(status_path, stdin=None, stdout=None):
         payload = {}
     model = payload.get("model") or {}
     window = payload.get("context_window") or {}
+    # claude's own account of how much of each limit is used (T35). Either
+    # block may be absent: an API-key session has none, and a claude that
+    # predates the field has none either.
+    limits = payload.get("rate_limits")
+    limits = limits if isinstance(limits, dict) else {}
+    five = limits.get("five_hour") if isinstance(limits.get("five_hour"), dict) else {}
+    week = limits.get("seven_day") if isinstance(limits.get("seven_day"), dict) else {}
     record = dict(model_id=model.get("id"),
                  context_window_size=window.get("context_window_size"),
                  session_id=payload.get("session_id"),
                  transcript_path=payload.get("transcript_path"),
+                 five_hour_percent=five.get("used_percentage"),
+                 five_hour_resets_at=five.get("resets_at"),
+                 seven_day_percent=week.get("used_percentage"),
                  at=time.time())
     try:
         parent = os.path.dirname(status_path)
@@ -7703,9 +8244,19 @@ def main(argv):
             time.sleep(max(0.0, CFG["update_notice"]))
 
     run_cfg = agent_cfg(CFG, agent_name)
+    # The session budget (T35) is claude's: codex has no statusline to report its
+    # limit in, so it is not paced, and a CR_SESSION_BUDGET that is not a
+    # percentage is said so rather than quietly taken for off.
+    if run_cfg.get("session_budget") and agent_name == "codex":
+        log("CR_SESSION_BUDGET is claude-only; codex is not paced")
+        run_cfg["session_budget"] = None
+    if os.environ.get("CR_SESSION_BUDGET", "") not in ("", "0") and not CFG["session_budget"]:
+        log("CR_SESSION_BUDGET=%r is not a percentage between 0 and 100; the budget is off"
+            % os.environ["CR_SESSION_BUDGET"])
     session_id = os.urandom(4).hex()
     handoff_registry = None
-    if run_cfg["context_tokens"] > 0 or run_cfg.get("context_restart_on"):
+    if (run_cfg["context_tokens"] > 0 or run_cfg.get("context_restart_on")
+            or run_cfg.get("session_budget")):
         # A custom phrase that drops {file} cannot carry a per-session handoff
         # path — worth one line in the log, once, rather than a silent fold
         # into a path nobody told the model about (T05).
@@ -7828,22 +8379,27 @@ def main(argv):
                                 echo=[CFG["message"], ctl.resume_text],
                                 registry=registry, log=log, grace=CFG["session_grace"],
                                 seeded=seeded)
-    if ctl.context_enabled:
-        agent_kind = "codex" if ctl.codex else "claude"
-        override = ctl._model_tokens_override()
-        if override:
-            threshold_desc = "%d tokens (per-model override)" % override
-        elif ctl.cfg["context_tokens"] > 0:
-            threshold_desc = "%d tokens" % ctl.cfg["context_tokens"]
-        else:
-            # The window is not known yet at this point (T19), so which of
-            # model_restart_at's own row or default_restart_at's fallback for
-            # a window it does not describe will supply the number is not
-            # decided until the model states one.
-            threshold_desc = ("the model's own profile, or %s's default for "
-                              "a window this build has never heard of" % agent_kind)
-        log("context restart armed: handoff -> %s, %s"
-            % (ctl.handoff_path, threshold_desc))
+    if ctl.context_enabled or ctl.budget is not None:
+        if ctl.context_enabled:
+            agent_kind = "codex" if ctl.codex else "claude"
+            override = ctl._model_tokens_override()
+            if override:
+                threshold_desc = "%d tokens (per-model override)" % override
+            elif ctl.cfg["context_tokens"] > 0:
+                threshold_desc = "%d tokens" % ctl.cfg["context_tokens"]
+            else:
+                # The window is not known yet at this point (T19), so which of
+                # model_restart_at's own row or default_restart_at's fallback for
+                # a window it does not describe will supply the number is not
+                # decided until the model states one.
+                threshold_desc = ("the model's own profile, or %s's default for "
+                                  "a window this build has never heard of" % agent_kind)
+            log("context restart armed: handoff -> %s, %s"
+                % (ctl.handoff_path, threshold_desc))
+        if ctl.budget is not None:
+            log("session budget armed: target %g%%, freeze %g min before it; forecast -> %s"
+                % (ctl.budget.target, ctl.cfg["budget_freeze_min"],
+                   ctl.cfg["forecast_file"] or "no file"))
         # The Write tool would create it, but a directory that is already there
         # is one fewer thing for the folding turn to get wrong.
         parent = os.path.dirname(ctl.handoff_path)
@@ -8125,6 +8681,9 @@ def main(argv):
                 for total, cap in usage_log.poll(watcher.agent.thread_id(watcher.current), now):
                     ctl.on_context(dict(kind="alive", source="log", path=watcher.current,
                                         sidechain=False, tokens=total, cap=cap), now)
+            # Before the statusline is read: a sample is weighed against the tokens
+            # written up to it (T35).
+            ctl.budget_poll(now)
             if status_poller is not None:
                 status = status_poller.poll_now(now)
                 if status:
@@ -8533,6 +9092,8 @@ export CR_HANDOFF_FILE CR_HANDOFF_MARKER CR_HANDOFF_MIN_BYTES CR_HANDOFF_ATTEMPT
 export CR_RESUME_ATTEMPTS
 export CR_HANDOFF_REGISTRY_DIR
 export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG CR_CANCEL_MSG
+export CR_SESSION_BUDGET CR_FORECAST_FILE CR_BUDGET_WINDOW_SEC CR_BUDGET_FREEZE_MIN
+export CR_BUDGET_SLOW_MSG CR_BUDGET_FREEZE_MSG
 export CR_CLAUDE_HANDOFF_MSG CR_CODEX_HANDOFF_MSG
 export CR_CLAUDE_CLEAR_CMD CR_CODEX_CLEAR_CMD
 export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG
