@@ -7,7 +7,7 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
-## [3.1.0] - unreleased
+## [3.1.0] - 2026-10-26
 
 ### Added
 - The session budget (`CR_SESSION_BUDGET`, claude only): the wrapper paces the
