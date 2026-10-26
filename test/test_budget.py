@@ -739,14 +739,33 @@ class TestNothingIsWrittenWithoutTheBudget(BudgetCase):
         self.assertEqual([l for l in ctl.log_lines if "budget" in l], [])
 
     def test_the_forecast_file_is_not_written_without_its_name(self):
+        # The budget is on and forecasts are computed; only the name is missing. So
+        # nothing may be written at all, anywhere: not through write_forecast, not
+        # by opening a file for writing, not by a rename or a replace.
         work = tempfile.mkdtemp(prefix="cr-budget-cwd-")
         self.addCleanup(shutil.rmtree, work, ignore_errors=True)
         here = os.getcwd()
         os.chdir(work)
         self.addCleanup(os.chdir, here)
         ctl = paced(forecast_file="")
-        self.to_slow(ctl)
-        self.to_freeze(ctl)
+        real_open, writes = open, []
+
+        def guarded_open(path, mode="r", *args, **kwargs):
+            if any(c in mode for c in "wax+"):
+                writes.append(path)
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch("builtins.open", guarded_open), \
+                mock.patch.object(tc.cr, "write_forecast") as write, \
+                mock.patch("os.rename") as rename, \
+                mock.patch("os.replace") as replace:
+            self.to_slow(ctl)
+            self.to_freeze(ctl)
+        self.assertIsNotNone(ctl.budget_forecast)     # the forecasts were computed
+        write.assert_not_called()
+        rename.assert_not_called()
+        replace.assert_not_called()
+        self.assertEqual(writes, [])
         self.assertEqual(os.listdir(work), [])
 
     def test_the_forecast_file_is_written_when_it_is_named(self):
