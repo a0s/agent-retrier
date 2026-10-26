@@ -11,6 +11,7 @@ variables.
 - [Usage limits and typing](#usage-limits-and-typing)
 - [Stalls](#stalls)
 - [Context restart](#context-restart)
+- [Session budget](#session-budget)
 - [Codex](#codex)
 - [The badge and the subagent overlay](#the-badge-and-the-subagent-overlay)
 - [Updates](#updates)
@@ -211,6 +212,19 @@ next to it. Set the shared one and both agents use it; set
 | `CR_SLASH_ENTER` | `2` | both | Enters sent for a `/command`; `1` turns the insurance Enter off |
 | `CR_SLASH_GAP_SEC` | `0.9` | both | pause after a `/command` before the first Enter, letting the command list settle on the exact match |
 | `CR_SLASH_ENTER_GAP_SEC` | `0.6` | both | gap between those two Enters |
+
+## Session budget
+
+More in [session-budget.md](session-budget.md). Claude only: codex is not paced.
+
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_SESSION_BUDGET` | off | claude | target, in percent of the 5-hour limit (above 0, up to 100). Empty or `0` is off. Turns the statusline proxy on, as the context restart does |
+| `CR_FORECAST_FILE` | none | claude | where the forecast is written, schema 1 (see [the file](session-budget.md#the-forecast-file)) |
+| `CR_BUDGET_WINDOW_SEC` | `600` | claude | how far back the pace is fitted |
+| `CR_BUDGET_FREEZE_MIN` | `5` | claude | freeze when the target is this many minutes away |
+| `CR_BUDGET_SLOW_MSG` | see [the messages](session-budget.md#the-messages) | claude | the slow message; `{percent}`, `{rate}`, `{forecast}`, `{resets}`, `{target}`, `{agents}`, `{file}` |
+| `CR_BUDGET_FREEZE_MSG` | see [the messages](session-budget.md#the-messages) | claude | the freeze message, typed before the handoff phrase; `{target}`, `{minutes}`, `{resets}` |
 
 ## Codex
 
