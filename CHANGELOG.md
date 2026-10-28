@@ -7,6 +7,20 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.1.1] - 2026-10-28
+
+### Fixed
+- The session budget no longer freezes a session on a few seconds of noise.
+  Claude reports the 5-hour percent as a whole number, and the pace used to be
+  fitted to the last ten minutes only: after any pause longer than that, the
+  next turn's two or three points, seconds apart, were the whole fit, and a
+  step of the whole number or the estimate running a tenth past it read as tens
+  of percent a minute. A session at 1% of its limit was asked for 0 agents and
+  then frozen until the reset. The pace is now a weighted fit over every point
+  of the window, recent ones leading, with the window's start at 0% as one
+  more point. `CR_BUDGET_WINDOW_SEC` is now how fast old points lose weight
+  (default 300) rather than how far back the fit looks.
+
 ## [3.1.0] - 2026-10-26
 
 ### Added
