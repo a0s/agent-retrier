@@ -221,7 +221,7 @@ More in [session-budget.md](session-budget.md). Claude only: codex is not paced.
 |---|---|---|---|
 | `CR_SESSION_BUDGET` | off | claude | target, in percent of the 5-hour limit (above 0, up to 100). Empty or `0` is off. Turns the statusline proxy on, as the context restart does |
 | `CR_FORECAST_FILE` | none | claude | where the forecast is written, schema 1 (see [the file](session-budget.md#the-forecast-file)) |
-| `CR_BUDGET_WINDOW_SEC` | `300` | claude | how fast old points lose weight in the pace fit (a point this old weighs 1/e) |
+| `CR_BUDGET_WINDOW_SEC` | `900` | claude | the pace is how far the percent moved over this many seconds |
 | `CR_BUDGET_FREEZE_MIN` | `5` | claude | freeze when the target is this many minutes away |
 | `CR_BUDGET_SLOW_MSG` | see [the messages](session-budget.md#the-messages) | claude | the slow message; `{percent}`, `{rate}`, `{forecast}`, `{resets}`, `{target}`, `{agents}`, `{file}` |
 | `CR_BUDGET_FREEZE_MSG` | see [the messages](session-budget.md#the-messages) | claude | the freeze message, typed before the handoff phrase; `{target}`, `{minutes}`, `{resets}` |

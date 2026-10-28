@@ -162,6 +162,7 @@ deliberately spends quota, and which nothing else depends on.
 | [T35](T35-session-budget.md) | Session budget: pace the 5-hour limit instead of hitting it | P1 | limits |
 | [T36](T36-budget-pace-after-a-pause.md) | Session budget: a pause no longer leaves a few seconds to decide the pace | P0 | limits |
 | [T37](T37-budget-slow-message-is-lifted.md) | Session budget: the agents allowed are those that made the pace, and a slow message is lifted | P0 | limits |
+| [T38](T38-budget-pace-over-a-horizon.md) | Session budget: the pace is the move over a horizon, not a fit to the latest points | P0 | limits |
 
 Epics: A — session identity; B — restart-machine guarantees; C — models and
 windows; D — per-agent commands and input; E — miscellaneous; F — subagent

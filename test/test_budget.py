@@ -50,20 +50,21 @@ def sample(ctl, t, percent, resets=RESET):
     ctl.on_status(dict(five_hour_percent=percent, five_hour_resets_at=resets, at=t), t)
 
 
-def tracker(target=97.0, freeze_min=5.0, window=600.0):
+def tracker(target=97.0, freeze_min=5.0, window=900.0):
     return cr.SessionBudget(target, window_sec=window, freeze_min=freeze_min)
 
 
 def pace(percent, rate, minutes_to_reset, target=97.0, freeze_min=5.0, active=None):
-    """The forecast of a tracker standing at `percent` at t=60, with a pace of
-    `rate` percent a minute, its window resetting `minutes_to_reset` later."""
-    b = tracker(target, freeze_min)
-    reset = 60 + minutes_to_reset * 60
-    b.on_sample(0, percent - rate, reset)
-    b.on_sample(60, percent, reset)
+    """The forecast of a tracker standing at `percent` at t=600, with a pace of
+    `rate` percent a minute over the 600 s before, its window resetting
+    `minutes_to_reset` later."""
+    b = tracker(target, freeze_min, window=600.0)
+    reset = 600 + minutes_to_reset * 60
+    b.on_sample(0, percent - 10 * rate, reset)
+    b.on_sample(600, percent, reset)
     if active is not None:
         b.active_agents = active
-    return b.snapshot(60)
+    return b.snapshot(600)
 
 
 class BudgetCase(unittest.TestCase):
@@ -121,95 +122,108 @@ class BudgetCase(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # the arithmetic
 # --------------------------------------------------------------------------- #
-class TestThePaceIsALeastSquaresLine(unittest.TestCase):
-    def test_two_samples_give_their_slope_in_percent_a_minute(self):
-        b = tracker()
+class TestThePaceIsHowFarThePercentMoved(unittest.TestCase):
+    """The pace is the move of the reported percent over the last window_sec, read
+    off straight lines between samples, 0% at the window's start (T38)."""
+
+    def test_the_move_over_the_horizon_in_percent_a_minute(self):
+        b = tracker(window=600.0)
+        b.on_sample(0, 50.0, 5000)
+        b.on_sample(600, 60.0, 5000)
+        self.assertAlmostEqual(b.snapshot(600)["rate"], 1.0)
+
+    def test_between_samples_the_percent_is_a_straight_line(self):
+        # 600 s back from t=900 is t=300, halfway from 50 at 0 to 56 at 600.
+        b = tracker(window=600.0)
+        b.on_sample(0, 50.0, 5000)
+        b.on_sample(600, 56.0, 5000)
+        b.on_sample(900, 60.0, 5000)
+        self.assertAlmostEqual(b.snapshot(900)["rate"], (60.0 - 53.0) / 10)
+
+    def test_before_its_first_sample_the_window_is_read_from_its_start(self):
+        # The window began two hours before t=0 at 0%; the wrapper's first sample
+        # says 30% at t=0: 0.25 a minute, the window's own average.
+        reset = 3 * 3600.0
+        b = tracker(window=600.0)
+        b.on_sample(0, 30.0, reset)
+        self.assertAlmostEqual(b.snapshot(0)["rate"], 0.25)
+
+    def test_after_the_newest_sample_the_percent_stands(self):
+        b = tracker(window=600.0)
         b.on_sample(0, 50.0, 5000)
         b.on_sample(60, 51.0, 5000)
-        self.assertAlmostEqual(b.snapshot(60)["rate"], 1.0, places=3)
+        self.assertAlmostEqual(b.snapshot(1000)["rate"], 0.0)
 
-    def test_many_samples_give_the_least_squares_slope(self):
-        # t = 0, 60, 120, 180 and percent 50, 50.5, 52, 52.5: the slope is 0.015 a
-        # second, which is 0.9 a minute.
-        b = tracker()
-        for t, p in ((0, 50.0), (60, 50.5), (120, 52.0), (180, 52.5)):
-            b.on_sample(t, p, 5000)
-        self.assertAlmostEqual(b.snapshot(180)["rate"], 0.9, places=2)
+    def test_before_the_window_began_nothing_was_used(self):
+        reset = 5 * 3600.0                       # the window began at 0
+        b = tracker(window=900.0)
+        b.on_sample(30, 1.0, reset)              # a step to 1 half a minute in
+        self.assertAlmostEqual(b.snapshot(30)["rate"], 60.0 / 900)
 
-    def test_one_sample_has_no_pace_at_all(self):
+    def test_no_sample_has_no_forecast(self):
+        self.assertIsNone(tracker().snapshot(0))
+
+    def test_a_freshly_started_wrapper_reads_no_pace_off_its_first_minute(self):
+        # T38, as seen live: a wrapper started three hours into the window at
+        # 11%, the whole number moved to 12 a minute later, and a fit through
+        # that minute read 0.98% a minute: 0 agents allowed.
+        reset = 5 * 3600.0
         b = tracker()
-        b.on_sample(0, 50.0, 5000)
-        snap = b.snapshot(0)
-        self.assertIsNone(snap["rate"])
-        self.assertIsNone(snap["forecast_at_reset"])
-        self.assertIsNone(snap["max_agents"])
+        b.on_sample(3 * 3600.0, 11.0, reset)
+        b.on_sample(3 * 3600.0 + 85, 12.0, reset)
+        snap = b.snapshot(3 * 3600.0 + 85)
+        # 12 against the 10.2 it stood at fifteen minutes back on the line from
+        # the window's start: one whole-number step over the horizon at most.
+        self.assertLess(snap["rate"], 0.15)
         self.assertEqual(snap["state"], "ok")
 
-    def test_samples_at_one_moment_have_no_slope(self):
-        b = tracker()
-        b.on_sample(5, 50.0, 5000)
-        b.on_sample(5, 60.0, 5000)
-        self.assertIsNone(b.snapshot(5)["rate"])
-
-    def test_recent_points_lead_the_fit(self):
-        # Flat at 50% for half an hour, then 1% a minute for the last ten: the
-        # pace follows the new slope without the flat half hour being thrown away.
-        b = tracker(window=300.0)
-        for t in range(0, 1801, 60):
-            b.on_sample(t, 50.0, 9000)
-        for t in range(1860, 2401, 60):
-            b.on_sample(t, 50.0 + (t - 1800) / 60.0, 9000)
-        self.assertGreater(b.snapshot(2400)["rate"], 0.5)
-        self.assertLess(b.snapshot(2400)["rate"], 1.0)
-
-    def test_a_point_ten_time_constants_old_is_let_go(self):
-        b = tracker(window=300.0)
-        for t in range(0, 8000, 60):
-            b.on_sample(t, 50.0, 9000)
-        self.assertGreaterEqual(b.points[0][0], 7980 - 3000)
-
     def test_a_pause_does_not_leave_a_few_seconds_to_decide_the_pace(self):
-        # T36, as seen in a live session: 1% of the limit, ten quiet minutes,
-        # then the next turn's reports a couple of seconds apart. The whole-number
-        # percent steps by one in that moment; the fit used to be those points
-        # alone and read tens of percent a minute — a freeze at 1%.
-        b = tracker(window=300.0)
-        reset = 5 * 3600.0                       # the window began at 0
+        # T36: 1% of the limit, ten quiet minutes, then the next turn's reports a
+        # couple of seconds apart, the whole number stepping by one.
+        reset = 5 * 3600.0
+        b = tracker()
         for t in range(600, 1201, 30):
             b.on_sample(t, 1.0, reset)
         b.on_sample(1900, 1.0, reset)
         b.on_sample(1902, 2.0, reset)
         snap = b.snapshot(1902)
-        self.assertLess(snap["rate"], 0.1)       # 2% in half an hour is 0.06 a minute
+        self.assertLess(snap["rate"], 0.1)
         self.assertEqual(snap["state"], "ok")
 
-    def test_the_estimate_zig_zagging_around_a_report_is_no_pace(self):
-        # The estimate between two reports runs a tenth past the whole number
-        # the next report says; over a few seconds after a pause that is no pace.
-        b = tracker(window=300.0)
+    def test_the_token_estimate_is_no_pace(self):
+        # Between two reports the estimate moves the percent shown, not the pace.
         reset = 5 * 3600.0
+        b = tracker()
         b.on_sample(0, 0.0, reset)
         b.add_usage(10, 1000)
         b.on_sample(60, 1.0, reset)              # calibrates: 1% per 1000 tokens
-        for t in range(120, 721, 60):
-            b.on_sample(t, 1.0, reset)
-        b.add_usage(1400, 100)                   # 1.1
-        b.on_sample(1403, 1.0, reset)            # back to the report
-        b.add_usage(1405, 100)                   # 1.1 again
-        snap = b.snapshot(1405)
-        self.assertLess(abs(snap["rate"]), 0.1)
-        self.assertEqual(snap["state"], "ok")
+        b.add_usage(1400, 500)
+        snap = b.snapshot(1400)
+        self.assertAlmostEqual(snap["percent"], 1.5)
+        self.assertAlmostEqual(snap["rate"], 0.0)           # the reports have not moved
 
-    def test_long_after_the_last_sample_its_pace_still_stands(self):
-        stale = tracker(window=600.0)
-        stale.on_sample(0, 50.0, 5000)
-        stale.on_sample(60, 51.0, 5000)
-        self.assertAlmostEqual(stale.snapshot(1000)["rate"], 1.0, places=3)
+    def test_the_estimate_stops_short_of_the_next_whole_number(self):
+        reset = 5 * 3600.0
+        b = tracker()
+        b.on_sample(0, 0.0, reset)
+        b.add_usage(10, 10)
+        b.on_sample(20, 1.0, reset)              # 1% for 10 tokens: a step, not a ratio
+        b.add_usage(30, 10000)
+        self.assertEqual(b.snapshot(30)["percent"], 2.0)
+
+    def test_a_real_burst_is_read_in_full_once_it_spans_the_horizon(self):
+        reset = 5 * 3600.0
+        b = tracker()
+        for t in range(0, 1801, 60):
+            b.on_sample(t, 10.0, reset)
+        for t in range(1860, 2701, 60):
+            b.on_sample(t, 10.0 + (t - 1800) / 60.0, reset)
+        self.assertAlmostEqual(b.snapshot(2700)["rate"], 1.0)
 
     def test_the_forecast_is_where_the_pace_stands_at_the_reset(self):
         snap = pace(91.0, 1.0, 6.5)
-        self.assertAlmostEqual(snap["forecast_at_reset"], 97.5, places=3)
-        self.assertAlmostEqual(snap["minutes_to_target"], 6.0, places=3)
+        self.assertAlmostEqual(snap["forecast_at_reset"], 97.5)
+        self.assertAlmostEqual(snap["minutes_to_target"], 6.0)
 
 
 class TestTheSamplesOfOneWindow(unittest.TestCase):
@@ -228,7 +242,7 @@ class TestTheSamplesOfOneWindow(unittest.TestCase):
         self.assertTrue(b.on_sample(20, 10.0, 3000))
         snap = b.snapshot(20)
         self.assertEqual(snap["percent"], 10.0)
-        self.assertIsNone(snap["rate"])
+        self.assertEqual(b.points, [(20, 10.0)])
 
     def test_a_window_already_over_has_no_forecast(self):
         b = tracker()
@@ -551,7 +565,7 @@ class TestTheSlowMessage(BudgetCase):
     def test_the_transition_is_logged(self):
         ctl = paced()
         self.to_slow(ctl)
-        self.assertTrue(any(line.startswith("budget: ok→slow 80.0% 180.00%/min")
+        self.assertTrue(any(line.startswith("budget: ok→slow 80.0% 3.17%/min")
                             for line in ctl.log_lines), ctl.log_lines)
 
     def test_again_when_the_agents_it_allows_have_halved(self):
@@ -915,8 +929,11 @@ class TestTheBudgetInAFakeSession(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
 
     def session(self, **env):
+        # A one-second horizon: the 50 → 80 the test types a moment apart is the
+        # pace, as fifteen minutes of it would be in a real session.
         e = helper.restart_timers(CR_SESSION_BUDGET="97", CR_BUDGET_FREEZE_MIN="0",
-                                  CR_MARGIN_SEC="0", FAKE_STATUS_RESETS_IN="12")
+                                  CR_MARGIN_SEC="0", FAKE_STATUS_RESETS_IN="12",
+                                  CR_BUDGET_WINDOW_SEC="1")
         e.update(env)
         s = helper.one_wrapper(self.work, e)
         self.addCleanup(s.close)
