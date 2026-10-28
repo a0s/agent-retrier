@@ -7,6 +7,19 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.1.2] - 2026-10-28
+
+### Fixed
+- A slow message no longer talks a session down to zero agents. The agents it
+  allowed were the pace divided by the agents running at that moment; the ones
+  it had just stopped dropped out of that count in two minutes while their pace
+  stayed in the fit for ten, so it was typed again every two minutes with half
+  as many, down to 0 at 9% of the limit. It now divides by the agents that made
+  the pace, weighted the way the pace is.
+- A slow message is lifted. The session was told to wait for the pace to drop
+  and could not see it drop; once the forecast is 10 points or more under the
+  target, `CR_BUDGET_CLEAR_MSG` tells it the limit on agents is lifted.
+
 ## [3.1.1] - 2026-10-28
 
 ### Fixed
