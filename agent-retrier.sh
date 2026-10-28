@@ -480,6 +480,10 @@ CR_BUDGET_FREEZE_MSG_DEFAULT='Session budget: the {target}% target will be reach
 # a freeze is no context restart, and the session should not be told it was one.
 CR_BUDGET_CANCEL_MSG_DEFAULT='The session-budget freeze was cancelled — the handoff is not needed now. Continue with what you were doing before it was requested.'
 : "${CR_BUDGET_CANCEL_MSG:=$CR_BUDGET_CANCEL_MSG_DEFAULT}"
+# Said once the pace is well under the target again after a slow message (T37):
+# without it the session waits for a pace it has no way to see.
+CR_BUDGET_CLEAR_MSG_DEFAULT='Session budget: the pace is back under the target: {percent}% of the 5-hour limit used, forecast {forecast}% at the reset ({resets}); target {target}%. The limit on parallel agents is lifted: carry on as before.'
+: "${CR_BUDGET_CLEAR_MSG:=$CR_BUDGET_CLEAR_MSG_DEFAULT}"
 # claude and codex do not speak the same commands, so a phrase that names one —
 # a slash command, a skill, a custom prompt — cannot be shared between them.
 # CR_CLAUDE_<X>/CR_CODEX_<X> override CR_<X> for one agent only; unset (the
@@ -943,6 +947,13 @@ BUDGET_FREEZE_MSG_DEFAULT = (
 BUDGET_CANCEL_MSG_DEFAULT = (
     "The session-budget freeze was cancelled — the handoff is not needed now. "
     "Continue with what you were doing before it was requested.")
+BUDGET_CLEAR_MSG_DEFAULT = (
+    "Session budget: the pace is back under the target: {percent}% of the 5-hour "
+    "limit used, forecast {forecast}% at the reset ({resets}); target {target}%. "
+    "The limit on parallel agents is lifted: carry on as before.")
+# A slow message stays in force until the forecast is this many points under the
+# target, so a forecast hovering at the target does not type slow and clear by turns.
+BUDGET_CLEAR_MARGIN = 10.0
 
 
 # No single number is "the" community consensus — recommendations run 40-70%,
@@ -1073,6 +1084,7 @@ CFG = dict(
     budget_slow_msg=_env("CR_BUDGET_SLOW_MSG", BUDGET_SLOW_MSG_DEFAULT),
     budget_freeze_msg=_env("CR_BUDGET_FREEZE_MSG", BUDGET_FREEZE_MSG_DEFAULT),
     budget_cancel_msg=_env("CR_BUDGET_CANCEL_MSG", BUDGET_CANCEL_MSG_DEFAULT),
+    budget_clear_msg=_env("CR_BUDGET_CLEAR_MSG", BUDGET_CLEAR_MSG_DEFAULT),
     # -- the copies of this program older versions left in $TMPDIR --
     tmp_sweep=_env("CR_TMP_SWEEP", "1") == "1",
 )
@@ -4237,6 +4249,7 @@ CONTEXT_DEFAULTS = dict(
     session_budget=None, budget_window_sec=300.0, budget_freeze_min=5.0,
     forecast_file="", budget_slow_msg=BUDGET_SLOW_MSG_DEFAULT,
     budget_freeze_msg=BUDGET_FREEZE_MSG_DEFAULT, budget_cancel_msg=BUDGET_CANCEL_MSG_DEFAULT,
+    budget_clear_msg=BUDGET_CLEAR_MSG_DEFAULT,
 )
 
 
@@ -4335,6 +4348,7 @@ class SessionBudget:
         self.seen = set()          # message ids already counted
         self.since = None          # when the first read happened (the agent had started)
         self.active_agents = 0     # subagent transcripts written in the last two minutes
+        self.agent_points = []     # (t, active_agents) at each read, weighted like the points
 
     def on_sample(self, t, percent, resets_at, seven_day=None):
         """One statusline report: `five_hour.used_percentage` at `resets_at`.
@@ -4388,6 +4402,10 @@ class SessionBudget:
                     self.active_agents += 1
             except OSError:
                 pass
+        self.agent_points.append((now, self.active_agents))
+        cut = now - BUDGET_KEEP_SPANS * self.window_sec
+        if self.agent_points[0][0] < cut:
+            self.agent_points = [pt for pt in self.agent_points if pt[0] >= cut]
         added = 0.0
         for path in ([transcript] if transcript else []) + subagents:
             if path not in self.offsets:
@@ -4425,7 +4443,7 @@ class SessionBudget:
             forecast = percent + rate * minutes_to_reset
             if rate > 0:
                 safe_rate = max(0.0, target - percent) / minutes_to_reset
-                max_agents = max(0, int(max(self.active_agents, 1) * safe_rate / rate))
+                max_agents = max(0, int(max(self._pacing_agents(now), 1) * safe_rate / rate))
         if percent >= target or (minutes_to_target is not None
                                  and minutes_to_target < self.freeze_min):
             state = "freeze"
@@ -4437,6 +4455,25 @@ class SessionBudget:
                     minutes_to_target=minutes_to_target, minutes_to_reset=minutes_to_reset,
                     max_agents=max_agents, active_agents=self.active_agents,
                     resets_at=self.resets_at, target=target, seven_day_percent=self.seven_day)
+
+    def _pacing_agents(self, now):
+        """How many agents the pace was made by: their count at each read, weighted
+        the way the points are (T37).
+
+        The count of the moment is not it. Agents stopped on a slow message stop
+        writing at once, and two minutes later they are no longer counted; the
+        pace they made fades out of the fit over ten. Dividing that pace by the
+        agents still running read as ever fewer allowed: 6, 3, 1, 0 two minutes
+        apart, at 9% of the limit with a pace already falling.
+        """
+        pts = self.agent_points
+        if not pts:
+            return self.active_agents
+        ws = [math.exp(-max(0.0, now - t) / self.window_sec) for t, _ in pts]
+        total = sum(ws)
+        if total <= 0:
+            return self.active_agents
+        return sum(w * n for w, (_, n) in zip(ws, pts)) / total
 
     def _estimate(self):
         p0, w0 = self.anchor
@@ -5778,8 +5815,10 @@ class Controller:
         """A budget message, when one is due and may be typed (T35).
 
         Slow: once, when the pace says the target would be overrun by the reset;
-        again only after the pace went back to ok, or the number of agents it
-        allows has at least halved. Freeze: once per 5-hour window, through the
+        again only after it was cleared, or the number of agents it allows has at
+        least halved. Clear: once a slow message is in force and the forecast is
+        BUDGET_CLEAR_MARGIN under the target (T37) -- the session was told to wait
+        for the pace to drop and cannot see it drop. Freeze: once per 5-hour window, through the
         restart's own handoff. Nothing is typed over a draft, into a turn still
         running, or while a restart or a limit is in flight.
         """
@@ -5787,15 +5826,14 @@ class Controller:
         if (self.budget is None or fc is None or self.hands_off
                 or self.state != IDLE or self.rstate is not None):
             return None
-        if fc["state"] == "ok":
-            self._budget_slow_sent = None      # back under: the next slow message is news
+        if fc["state"] == "ok" and not self._budget_cleared(fc):
             return None
         if now < self._budget_wake:
             return None
         if fc["state"] == "freeze":
             if self._budget_frozen_for == fc["resets_at"]:
                 return None
-        elif self._budget_slow_sent is not None:
+        elif fc["state"] == "slow" and self._budget_slow_sent is not None:
             sent, agents = self._budget_slow_sent, fc["max_agents"] or 0
             if not (sent > 0 and agents * 2 <= sent):
                 return None
@@ -5804,7 +5842,16 @@ class Controller:
             return self._budget_hold(now, why)
         if fc["state"] == "freeze":
             return self._start_freeze(fc, now)
+        if fc["state"] == "ok":
+            return self._send_budget_clear(fc, now)
         return self._send_slow(fc, now)
+
+    def _budget_cleared(self, fc):
+        """Is a slow message in force, and the forecast well under the target?"""
+        if self._budget_slow_sent is None:
+            return False
+        forecast = fc["forecast_at_reset"]
+        return forecast is None or forecast <= fc["target"] - BUDGET_CLEAR_MARGIN
 
     def _budget_gate(self, now):
         """Why nothing may be typed for the budget now, or None: the gates a restart
@@ -5845,12 +5892,23 @@ class Controller:
                  % (fc["max_agents"] or 0))
         return ("inject", text, self._take_dismiss())
 
+    def _send_budget_clear(self, fc, now):
+        text = expand_skill(self._render_budget(self.cfg["budget_clear_msg"], fc), "claude")
+        self._budget_slow_sent = None          # cleared: the next slow message is news
+        self._budget_held = None
+        self._budget_note = "session budget: the pace is back under the target; agents may run again"
+        self.log("budget: clear message typed (forecast %s%%)"
+                 % ("n/a" if fc["forecast_at_reset"] is None
+                    else "%.0f" % fc["forecast_at_reset"]))
+        return ("inject", text, self._take_dismiss())
+
     def _start_freeze(self, fc, now):
         """The freeze: the freeze message, then the handoff phrase, through the same
         restart machinery as a context restart. Once the handoff is accepted the
         session waits for its window to reset, and only then is it unfolded (T35)."""
         self._budget_frozen_for = fc["resets_at"]
         self._budget_freeze = True
+        self._budget_slow_sent = None          # the unfold says to carry on; no clear after it
         self._budget_held = None
         self._budget_resets_at = fc["resets_at"]
         message = expand_skill(self._render_budget(self.cfg["budget_freeze_msg"], fc), "claude")
@@ -9130,7 +9188,7 @@ export CR_RESUME_ATTEMPTS
 export CR_HANDOFF_REGISTRY_DIR
 export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG CR_CANCEL_MSG
 export CR_SESSION_BUDGET CR_FORECAST_FILE CR_BUDGET_WINDOW_SEC CR_BUDGET_FREEZE_MIN
-export CR_BUDGET_SLOW_MSG CR_BUDGET_FREEZE_MSG CR_BUDGET_CANCEL_MSG
+export CR_BUDGET_SLOW_MSG CR_BUDGET_FREEZE_MSG CR_BUDGET_CANCEL_MSG CR_BUDGET_CLEAR_MSG
 export CR_CLAUDE_HANDOFF_MSG CR_CODEX_HANDOFF_MSG
 export CR_CLAUDE_CLEAR_CMD CR_CODEX_CLEAR_CMD
 export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG

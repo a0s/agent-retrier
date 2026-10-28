@@ -37,6 +37,7 @@ def paced(target=97.0, **over):
     cfg = dict(session_budget=target, budget_freeze_min=0.0, budget_window_sec=600.0,
                budget_slow_msg=cr.BUDGET_SLOW_MSG_DEFAULT,
                budget_freeze_msg=cr.BUDGET_FREEZE_MSG_DEFAULT,
+               budget_clear_msg=cr.BUDGET_CLEAR_MSG_DEFAULT,
                forecast_file="", poll=0, context_tokens=0, context_restart_on=False)
     cfg.update(over)
     ctl = tc.restart_controller(**cfg)
@@ -345,6 +346,22 @@ class TestMaxAgents(unittest.TestCase):
         self.assertEqual(pace(90.0, 0.1, 20, active=0)["max_agents"], 3)
         self.assertEqual(pace(90.0, 0.1, 20, active=3)["max_agents"], 10)   # 10.5
 
+    def test_the_agents_are_those_that_made_the_pace_not_those_left(self):
+        # T37, as seen live: six agents made the pace, the slow message stopped
+        # them, and two minutes later none was counted while their pace was still
+        # in the fit -- 6, 3, 1, 0 allowed at 9% of the limit.
+        b = tracker(window=300.0)
+        reset = 3 * 3600.0
+        for t in range(0, 601, 30):
+            b.on_sample(t, 5.0 + t / 150.0, reset)          # 0.4% a minute
+            b.agent_points.append((t, 6))
+        b.agent_points.append((630, 0))                     # all stopped
+        b.active_agents = 0
+        snap = b.snapshot(630)
+        self.assertEqual(snap["active_agents"], 0)
+        self.assertGreater(b._pacing_agents(630), 5.0)
+        self.assertGreaterEqual(snap["max_agents"], 3)
+
     def test_at_the_target_no_agent_is_allowed(self):
         self.assertEqual(pace(97.0, 1.0, 10)["max_agents"], 0)
 
@@ -547,14 +564,36 @@ class TestTheSlowMessage(BudgetCase):
         self.tick_only(ctl, 12)
         self.assertEqual(len(self.injected()), 2)
 
-    def test_again_after_the_pace_went_back_to_ok(self):
+    def test_again_after_the_pace_was_cleared(self):
         ctl = paced()
         self.to_slow(ctl)
-        ctl.budget_forecast = dict(ctl.budget_forecast, state="ok")
+        ctl.budget_forecast = dict(ctl.budget_forecast, state="ok", forecast_at_reset=50.0)
         self.tick_only(ctl, 11)
         ctl.budget_forecast = dict(ctl.budget_forecast, state="slow", max_agents=0)
         self.tick_only(ctl, 12)
+        self.assertEqual(len(self.injected()), 3)          # slow, clear, slow
+
+    def test_the_clear_message_lifts_a_slow_one_once_the_forecast_is_well_under(self):
+        # T37: told to wait "until the pace drops", the session cannot see it drop.
+        ctl = paced(budget_clear_msg="CLEAR {percent}% forecast {forecast}%")
+        self.to_slow(ctl)
+        ctl.budget_forecast = dict(ctl.budget_forecast, state="ok", forecast_at_reset=95.0)
+        self.tick_only(ctl, 11)                             # under, but not by the margin
+        self.assertEqual(len(self.injected()), 1)
+        ctl.budget_forecast = dict(ctl.budget_forecast, state="ok", forecast_at_reset=40.0)
+        self.tick_only(ctl, 12)
+        self.tick_only(ctl, 13)
         self.assertEqual(len(self.injected()), 2)
+        self.assertTrue(self.injected()[1].startswith("CLEAR "), self.injected())
+        self.assertIn("forecast 40%", self.injected()[1])
+        self.assertIn("budget: clear message typed (forecast 40%)", "\n".join(ctl.log_lines))
+
+    def test_no_clear_without_a_slow_message_before_it(self):
+        ctl = paced()
+        sample(ctl, 0, 10.0)
+        sample(ctl, 60, 10.1)
+        self.step(ctl, 60)
+        self.assertEqual(self.injected(), [])
 
     def test_nothing_is_typed_for_a_roster_or_a_limit_in_flight(self):
         ctl = paced()
@@ -706,11 +745,13 @@ class TestTheOverridesReplaceTheDefaults(BudgetCase):
         out = subprocess.run(
             ["bash", "-c",
              'set -u; eval "$(sed -n "/^CR_BUDGET_[A-Z_]*_DEFAULT=/p" "$1")"; '
-             'printf "%s\\0%s\\0%s" "$CR_BUDGET_SLOW_MSG_DEFAULT" '
-             '"$CR_BUDGET_FREEZE_MSG_DEFAULT" "$CR_BUDGET_CANCEL_MSG_DEFAULT"',
+             'printf "%s\\0%s\\0%s\\0%s" "$CR_BUDGET_SLOW_MSG_DEFAULT" '
+             '"$CR_BUDGET_FREEZE_MSG_DEFAULT" "$CR_BUDGET_CANCEL_MSG_DEFAULT" '
+             '"$CR_BUDGET_CLEAR_MSG_DEFAULT"',
              "_", script],
             capture_output=True, text=True, check=True).stdout
-        slow, freeze, cancel = out.split("\0")
+        slow, freeze, cancel, clear = out.split("\0")
+        self.assertEqual(clear, cr.BUDGET_CLEAR_MSG_DEFAULT)
         self.assertEqual(slow, cr.BUDGET_SLOW_MSG_DEFAULT)
         self.assertEqual(freeze, cr.BUDGET_FREEZE_MSG_DEFAULT)
         self.assertEqual(cancel, cr.BUDGET_CANCEL_MSG_DEFAULT)

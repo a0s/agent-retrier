@@ -52,9 +52,13 @@ reset:
 - `rate` is the slope, in percent a minute;
 - `forecast_at_reset = percent + rate × minutes to reset`;
 - `minutes_to_target = (target − percent) / rate`;
-- `max_agents = floor(max(active, 1) × safe_rate / rate)`, where `safe_rate` is
-  the pace that would just reach the target at the reset and `active` is the
-  number of subagent transcripts written in the last two minutes.
+- `max_agents = floor(max(agents, 1) × safe_rate / rate)`, where `safe_rate` is
+  the pace that would just reach the target at the reset and `agents` is the
+  number of agents that made the pace: the count of subagent transcripts
+  written in the last two minutes, taken at each read and weighted like the
+  points. Not the count of the moment: agents stopped on a slow message drop out
+  of it in two minutes while their pace stays in the fit for ten, and dividing
+  one by the other once allowed 6, 3, 1 and then 0 agents, two minutes apart.
 
 The state is `freeze` when the percent is at the target or `minutes_to_target`
 is under `CR_BUDGET_FREEZE_MIN`; `slow` when `forecast_at_reset` is over the
@@ -65,7 +69,7 @@ reset is dropped, and a newer one starts that window afresh.
 
 ## The messages
 
-Both are typed through the wrapper's usual safe path: not over a draft in the
+They are typed through the wrapper's usual safe path: not over a draft in the
 prompt box, not while a person is typing, and not while the session is running
 a turn. Each is one line.
 
@@ -73,14 +77,25 @@ a turn. Each is one line.
 |---|---|---|
 | slow | `Session budget: {percent}% of the 5-hour limit used, pace {rate}%/min, forecast {forecast}% at the reset ({resets}); target {target}%. Reduce parallel work to at most {agents} agents: start no new ones until the pace drops.` | `{percent} {rate} {forecast} {resets} {target} {agents}` |
 | freeze | `Session budget: the {target}% target will be reached in about {minutes} min (reset at {resets}). Start no new agents and stop the running ones at a safe point.` followed by the handoff phrase | `{target} {minutes} {resets}`, and the handoff phrase's own `{file}`, `{marker}` |
+| clear | `Session budget: the pace is back under the target: {percent}% of the 5-hour limit used, forecast {forecast}% at the reset ({resets}); target {target}%. The limit on parallel agents is lifted: carry on as before.` | `{percent} {forecast} {resets} {target}` |
 | cancel | `The session-budget freeze was cancelled — the handoff is not needed now. Continue with what you were doing before it was requested.` | none |
 
 `{rate}` is percent a minute, `{forecast}` percent at the reset, `{minutes}`
 minutes to the target, `{resets}` the local time of the reset (HH:MM),
 `{agents}` the number of agents the pace allows. `{file}` is the handoff file
 and `{skill:NAME}` expands to `/NAME`, as in the other phrases. Override them
-with `CR_BUDGET_SLOW_MSG`, `CR_BUDGET_FREEZE_MSG` and `CR_BUDGET_CANCEL_MSG`. The
-cancel phrase is typed only when a freeze is called off after the session has
+with `CR_BUDGET_SLOW_MSG`, `CR_BUDGET_FREEZE_MSG`, `CR_BUDGET_CLEAR_MSG` and
+`CR_BUDGET_CANCEL_MSG`.
+
+A slow message stays in force until the clear message lifts it. The session was
+told to wait for the pace to drop and has no way to see it drop, so once the
+forecast is 10 points or more under the target the clear message says so. A
+forecast just under the target lifts nothing, so a pace hovering at the target
+does not type slow and clear by turns. While a slow message is in force it is
+typed again only when the agents it allows have at least halved. A freeze ends
+it too: the unfold already says to carry on.
+
+The cancel phrase is typed only when a freeze is called off after the session has
 seen its freeze phrase; an aborted context restart keeps `CR_CANCEL_MSG`, since
 a freeze is no restart and the session should not be told it was one. The handoff phrase always
 follows the freeze message, because the freeze is only complete with a verified
@@ -142,6 +157,7 @@ means *freeze*. The wrapper does not know or care who reads the file.
 | `CR_BUDGET_FREEZE_MIN` | `5` | freeze when the target is this many minutes away |
 | `CR_BUDGET_SLOW_MSG` | see above | the slow message |
 | `CR_BUDGET_FREEZE_MSG` | see above | the freeze message, before the handoff phrase |
+| `CR_BUDGET_CLEAR_MSG` | see above | the message that lifts a slow one |
 | `CR_BUDGET_CANCEL_MSG` | see above | the phrase that calls off a freeze the session had seen |
 
 The resume waits for the reset plus `CR_MARGIN_SEC`, as a usage limit does; the
