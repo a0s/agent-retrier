@@ -7,6 +7,18 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.1.3] - 2026-10-28
+
+### Fixed
+- A freshly started wrapper no longer reads a pace off its first minute. With
+  no samples of its own, claude's whole-number percent stepping from 11 to 12
+  read as nearly a percent a minute, three hours into the window, and 0 agents
+  were allowed. The pace is now how far the reported percent moved over the
+  last `CR_BUDGET_WINDOW_SEC` (now 900 s), with the window's start at 0% where
+  the wrapper has no samples that far back: the whole-number error is one point
+  over fifteen minutes at most. The token estimate between two reports moves
+  the percent shown, never past the next whole number, and not the pace.
+
 ## [3.1.2] - 2026-10-28
 
 ### Fixed
