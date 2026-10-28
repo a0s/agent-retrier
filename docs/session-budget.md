@@ -39,9 +39,15 @@ two samples the percent is estimated from the tokens the session and its
 subagents have written, weighted (output 5, input 1, cache writes 1.25, cache
 reads 0.1). The estimate is calibrated from the last pair of samples that moved.
 
-The pace is a least-squares line through the points of the last
-`CR_BUDGET_WINDOW_SEC` seconds, and the forecast is where that line stands at
-the reset:
+The pace is a weighted least-squares line through every point of the window.
+A point's weight is `exp(−age / CR_BUDGET_WINDOW_SEC)`, so recent points lead
+and older ones keep the slope in place; the window's start, 0% five hours
+before the reset, is one more point. Claude reports the percent as a whole
+number and the estimate between two reports overshoots it a little, so the
+points of a few seconds always zig-zag: a fit that saw only those (a cut-off
+window emptied by a pause) once read 1.0 → 1.1 → 1.0 as 58% a minute and froze
+a session at 1% of its limit. The forecast is where the line stands at the
+reset:
 
 - `rate` is the slope, in percent a minute;
 - `forecast_at_reset = percent + rate × minutes to reset`;
@@ -132,7 +138,7 @@ means *freeze*. The wrapper does not know or care who reads the file.
 |---|---|---|
 | `CR_SESSION_BUDGET` | off | target, in percent of the 5-hour limit (above 0 and up to 100). Empty or `0` is off |
 | `CR_FORECAST_FILE` | none | where the forecast is written (schema 1) |
-| `CR_BUDGET_WINDOW_SEC` | `600` | how far back the pace is fitted |
+| `CR_BUDGET_WINDOW_SEC` | `300` | how fast old points lose weight in the pace fit (a point this old weighs 1/e) |
 | `CR_BUDGET_FREEZE_MIN` | `5` | freeze when the target is this many minutes away |
 | `CR_BUDGET_SLOW_MSG` | see above | the slow message |
 | `CR_BUDGET_FREEZE_MSG` | see above | the freeze message, before the handoff phrase |

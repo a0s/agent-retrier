@@ -469,7 +469,7 @@ CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not 
 # CR_FORECAST_FILE, when set, is where the forecast is written for other tools.
 : "${CR_SESSION_BUDGET:=}"             # target percent of the 5-hour limit; empty or 0 = off
 : "${CR_FORECAST_FILE:=}"              # the forecast, schema v1; unset = no file
-: "${CR_BUDGET_WINDOW_SEC:=600}"       # look-back of the pace fit
+: "${CR_BUDGET_WINDOW_SEC:=300}"       # time constant of the pace fit: a point this old weighs 1/e
 : "${CR_BUDGET_FREEZE_MIN:=5}"         # freeze when the target is this many minutes away
 CR_BUDGET_SLOW_MSG_DEFAULT='Session budget: {percent}% of the 5-hour limit used, pace {rate}%/min, forecast {forecast}% at the reset ({resets}); target {target}%. Reduce parallel work to at most {agents} agents: start no new ones until the pace drops.'
 : "${CR_BUDGET_SLOW_MSG:=$CR_BUDGET_SLOW_MSG_DEFAULT}"
@@ -861,6 +861,7 @@ import errno
 import fcntl
 import glob
 import json
+import math
 import os
 import pty
 import re
@@ -1067,7 +1068,7 @@ CFG = dict(
     # -- the session budget (T35): claude only, off unless a percentage is set --
     session_budget=_budget_target(os.environ.get("CR_SESSION_BUDGET")),
     forecast_file=_env("CR_FORECAST_FILE", ""),
-    budget_window_sec=_env_positive("CR_BUDGET_WINDOW_SEC", 600.0),
+    budget_window_sec=_env_positive("CR_BUDGET_WINDOW_SEC", 300.0),
     budget_freeze_min=max(0.0, _env("CR_BUDGET_FREEZE_MIN", 5.0, float)),
     budget_slow_msg=_env("CR_BUDGET_SLOW_MSG", BUDGET_SLOW_MSG_DEFAULT),
     budget_freeze_msg=_env("CR_BUDGET_FREEZE_MSG", BUDGET_FREEZE_MSG_DEFAULT),
@@ -4233,7 +4234,7 @@ CONTEXT_DEFAULTS = dict(
     model_lookup=False, model_lookup_timeout=10.0,
     model_cache=os.path.expanduser("~/.agent-retrier/windows.json"),
     model_cache_ttl=604800.0, models_doc_url="", models_api_url="",
-    session_budget=None, budget_window_sec=600.0, budget_freeze_min=5.0,
+    session_budget=None, budget_window_sec=300.0, budget_freeze_min=5.0,
     forecast_file="", budget_slow_msg=BUDGET_SLOW_MSG_DEFAULT,
     budget_freeze_msg=BUDGET_FREEZE_MSG_DEFAULT, budget_cancel_msg=BUDGET_CANCEL_MSG_DEFAULT,
 )
@@ -4246,11 +4247,15 @@ CONTEXT_DEFAULTS = dict(
 # statusline JSON), but only when it draws the statusline, so between two of its
 # updates the percent is estimated from the weighted tokens of the session and of
 # its subagents, with a percent-per-token ratio calibrated from the last pair of
-# statusline samples that moved. The pace is a least-squares line over the last
-# CR_BUDGET_WINDOW_SEC; the forecast is where that line stands at the reset.
+# statusline samples that moved. The pace is a least-squares line over every
+# point of the window, each weighted by its age (CR_BUDGET_WINDOW_SEC is the time
+# constant), with the window's start at 0% as one more point; the forecast is
+# where that line stands at the reset.
 BUDGET_WEIGHTS = (("output_tokens", 5.0), ("input_tokens", 1.0),
                   ("cache_creation_input_tokens", 1.25), ("cache_read_input_tokens", 0.1))
 SUBAGENT_ACTIVE_SEC = 120.0     # a subagent transcript written this recently is running
+FIVE_HOUR_SEC = 5 * 3600.0      # the window's length: it began this long before its reset
+BUDGET_KEEP_SPANS = 10.0        # a point this many time constants old weighs nothing worth keeping
 FORECAST_SCHEMA = 1
 FORECAST_KEYS = ("v", "agent", "session", "updated_at", "percent", "rate_per_min",
                  "resets_at", "forecast_at_reset", "minutes_to_target", "target", "state",
@@ -4315,7 +4320,7 @@ class SessionBudget:
     transcripts that moved the percent on from the last sample.
     """
 
-    def __init__(self, target, window_sec=600.0, freeze_min=5.0, log=None):
+    def __init__(self, target, window_sec=300.0, freeze_min=5.0, log=None):
         self.target = float(target)
         self.window_sec = float(window_sec)
         self.freeze_min = float(freeze_min)
@@ -4441,24 +4446,39 @@ class SessionBudget:
 
     def _add_point(self, t, percent):
         self.points.append((t, percent))
-        cut = t - self.window_sec
+        cut = t - BUDGET_KEEP_SPANS * self.window_sec
         if self.points[0][0] < cut:
             self.points = [pt for pt in self.points if pt[0] >= cut]
 
     def _rate(self, now):
-        """The least-squares slope of the points in the window, in percent a minute,
-        or None with fewer than two points (or no spread in time to fit)."""
-        cut = now - self.window_sec
-        pts = [pt for pt in self.points if pt[0] >= cut]
-        n = len(pts)
-        if n < 2:
+        """The weighted least-squares slope of the window's points, in percent a
+        minute, or None with fewer than two samples (or no spread in time to fit).
+
+        Every point counts, weighted by exp(-age / window_sec), and so does the
+        window's start: 0% at five hours before the reset. A cut-off window used
+        to be emptied by any pause longer than itself, and then the two or three
+        points that came after it, seconds apart, were the whole fit: the percent
+        claude reports is a whole number, the estimate between two reports
+        overshoots it by a tenth, and 1.0 → 1.1 → 1.0 over a few seconds read as
+        tens of percent a minute — a freeze at 1% of the limit (T36). The older
+        points keep the slope where the session has actually been going.
+        """
+        if len(self.points) < 2:
             return None
-        mean_t = sum(t for t, _ in pts) / n
-        mean_p = sum(p for _, p in pts) / n
-        sxx = sum((t - mean_t) ** 2 for t, _ in pts)
-        if sxx <= 0:
+        pts = [(t, p, math.exp(-max(0.0, now - t) / self.window_sec))
+               for t, p in self.points]
+        start = self.resets_at - FIVE_HOUR_SEC
+        if start <= now:
+            pts.append((start, 0.0, math.exp(-(now - start) / self.window_sec)))
+        sw = sum(w for _, _, w in pts)
+        if sw <= 0:
             return None
-        sxy = sum((t - mean_t) * (p - mean_p) for t, p in pts)
+        mean_t = sum(w * t for t, _, w in pts) / sw
+        mean_p = sum(w * p for _, p, w in pts) / sw
+        sxx = sum(w * (t - mean_t) ** 2 for t, _, w in pts)
+        if sxx <= 0 or len({t for t, _ in self.points}) < 2:
+            return None
+        sxy = sum(w * (t - mean_t) * (p - mean_p) for t, p, w in pts)
         return 60.0 * sxy / sxx
 
 
@@ -4728,7 +4748,7 @@ class Controller:
         self.budget = None
         if cfg.get("session_budget") and not self.codex:
             self.budget = SessionBudget(cfg["session_budget"],
-                                        window_sec=cfg.get("budget_window_sec", 600.0),
+                                        window_sec=cfg.get("budget_window_sec", 300.0),
                                         freeze_min=cfg.get("budget_freeze_min", 5.0),
                                         log=self.log)
         self.budget_forecast = None      # the last forecast (SessionBudget.snapshot)
