@@ -223,6 +223,8 @@ More in [session-budget.md](session-budget.md). Claude only: codex is not paced.
 | `CR_FORECAST_FILE` | none | claude | where the forecast is written, schema 1 (see [the file](session-budget.md#the-forecast-file)) |
 | `CR_BUDGET_WINDOW_SEC` | `900` | claude | the pace is how far the percent moved over this many seconds |
 | `CR_BUDGET_FREEZE_MIN` | `5` | claude | freeze when the target is this many minutes away |
+| `CR_BUDGET_BURST_MIN` | `45` | claude | how long the pace of the moment is taken to hold before the window's average takes over |
+| `CR_BUDGET_HOLD_SEC` | `180` | claude | how long a budget state holds before a message says so; reaching the target freezes at once |
 | `CR_BUDGET_SLOW_MSG` | see [the messages](session-budget.md#the-messages) | claude | the slow message; `{percent}`, `{rate}`, `{forecast}`, `{resets}`, `{target}`, `{agents}`, `{file}` |
 | `CR_BUDGET_FREEZE_MSG` | see [the messages](session-budget.md#the-messages) | claude | the freeze message, typed before the handoff phrase; `{target}`, `{minutes}`, `{resets}` |
 | `CR_BUDGET_CLEAR_MSG` | see [the messages](session-budget.md#the-messages) | claude | the message that lifts a slow one once the forecast is 10 points under the target; `{percent}`, `{forecast}`, `{resets}`, `{target}` |

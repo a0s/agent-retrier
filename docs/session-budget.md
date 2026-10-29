@@ -55,20 +55,34 @@ in 15 minutes, 0.07% a minute, at most. Between two reports the percent shown
 moves on by an estimate from the tokens written since, never past the next
 whole number; the pace does not use the estimate.
 
-- `rate` is that move, in percent a minute;
-- `forecast_at_reset = percent + rate × minutes to reset`;
-- `minutes_to_target = (target − percent) / rate`;
-- `max_agents = floor(max(agents, 1) × safe_rate / rate)`, where `safe_rate` is
-  the pace that would just reach the target at the reset and `agents` is the
-  number of agents that made the pace: the mean, over the same horizon, of the
-  count of subagent transcripts written in the last two minutes. Not the count
-  of the moment: agents stopped on a slow message drop out of it in two minutes
-  while their pace stays in the horizon, and dividing one by the other once
-  allowed 6, 3, 1 and then 0 agents, two minutes apart.
+Work comes in bursts with quiet between them, so the pace of the moment is not
+carried all the way to the reset: it holds for `CR_BUDGET_BURST_MIN` (45
+minutes), and after that the window goes on at its own average, the percent
+over the time since the window began (but over no less than the burst: in its
+first minutes a window has seen one burst and nothing else). Carried to the
+reset, the pace of a burst forecast 102–109% on windows that ended at 57–60%.
+
+- `rate` is that move, in percent a minute; `burst = min(minutes to reset,
+  CR_BUDGET_BURST_MIN)`, `average = percent / max(minutes since the window
+  began, CR_BUDGET_BURST_MIN)`;
+- `forecast_at_reset = percent + rate × burst + average × (minutes to reset − burst)`;
+- `minutes_to_target` follows the same line: `(target − percent) / rate` when
+  the burst gets there, else the burst and then the average;
+- `max_agents = floor(max(agents, 1) × factor)`, where `factor` is how much of
+  the burst's pace still fits: `(target − percent − average × rest) / (rate ×
+  burst)`. `agents` is the number of agents that made the pace: the mean, over
+  the pace's horizon, of the count of subagent transcripts written in the last
+  two minutes. Not the count of the moment: agents stopped on a slow message
+  drop out of it in two minutes while their pace stays in the horizon, and
+  dividing one by the other once allowed 6, 3, 1 and then 0 agents, two minutes
+  apart.
 
 The state is `freeze` when the percent is at the target or `minutes_to_target`
 is under `CR_BUDGET_FREEZE_MIN`; `slow` when `forecast_at_reset` is over the
-target; otherwise `ok`.
+target; otherwise `ok`. A state says nothing until it has held for
+`CR_BUDGET_HOLD_SEC` (3 minutes): one whole-number step moves the forecast by
+several points, and a forecast at the target once typed slow and clear six times
+in twelve minutes. Reaching the target itself freezes at once.
 
 Only samples of the window being paced count. A sample that names an older
 reset is dropped, and a newer one starts that window afresh.
@@ -161,6 +175,8 @@ means *freeze*. The wrapper does not know or care who reads the file.
 | `CR_FORECAST_FILE` | none | where the forecast is written (schema 1) |
 | `CR_BUDGET_WINDOW_SEC` | `900` | the pace is how far the percent moved over this many seconds |
 | `CR_BUDGET_FREEZE_MIN` | `5` | freeze when the target is this many minutes away |
+| `CR_BUDGET_BURST_MIN` | `45` | how long the pace of the moment is taken to hold before the window's average takes over |
+| `CR_BUDGET_HOLD_SEC` | `180` | how long a state holds before a message says so |
 | `CR_BUDGET_SLOW_MSG` | see above | the slow message |
 | `CR_BUDGET_FREEZE_MSG` | see above | the freeze message, before the handoff phrase |
 | `CR_BUDGET_CLEAR_MSG` | see above | the message that lifts a slow one |

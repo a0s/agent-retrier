@@ -35,6 +35,7 @@ def paced(target=97.0, **over):
     """A controller paced at `target`, built the way test_controller builds its
     restart controllers, with no context restart and nobody typing."""
     cfg = dict(session_budget=target, budget_freeze_min=0.0, budget_window_sec=600.0,
+               budget_hold_sec=0.0, budget_burst_min=1e9,
                budget_slow_msg=cr.BUDGET_SLOW_MSG_DEFAULT,
                budget_freeze_msg=cr.BUDGET_FREEZE_MSG_DEFAULT,
                budget_clear_msg=cr.BUDGET_CLEAR_MSG_DEFAULT,
@@ -50,8 +51,11 @@ def sample(ctl, t, percent, resets=RESET):
     ctl.on_status(dict(five_hour_percent=percent, five_hour_resets_at=resets, at=t), t)
 
 
-def tracker(target=97.0, freeze_min=5.0, window=900.0):
-    return cr.SessionBudget(target, window_sec=window, freeze_min=freeze_min)
+def tracker(target=97.0, freeze_min=5.0, window=900.0, burst=1e9):
+    """A tracker whose pace of the moment holds to the reset, unless `burst`
+    says for how long (T39): the arithmetic of the pace on its own."""
+    return cr.SessionBudget(target, window_sec=window, freeze_min=freeze_min,
+                            burst_min=burst)
 
 
 def pace(percent, rate, minutes_to_reset, target=97.0, freeze_min=5.0, active=None):
@@ -346,6 +350,60 @@ class TestTheWeightsOfATranscript(unittest.TestCase):
         self.assertEqual(b.active_agents, 1)
 
 
+class TestABurstFadesIntoTheWindowsAverage(unittest.TestCase):
+    """T39: the pace of the moment holds for burst_min, then the window goes on at
+    its own average. A burst carried to the reset said 102-109% on windows that
+    ended at 57-60%."""
+
+    def burst_at(self, minutes_in, percent, rate, burst=45.0):
+        # A window that began at 0; `rate` percent a minute over the last 15
+        # minutes, standing at `percent` `minutes_in` minutes into it.
+        b = tracker(target=99.0, burst=burst)
+        now = minutes_in * 60.0
+        b.on_sample(now - 900, percent - 15 * rate, 5 * 3600.0)
+        b.on_sample(now, percent, 5 * 3600.0)
+        return b.snapshot(now)
+
+    def test_the_forecast_is_the_burst_then_the_average(self):
+        # 180 min in at 30%, 0.6 a minute: 45 minutes of that is 27 points, then
+        # 75 minutes at 30/180 a minute is 12.5 more.
+        snap = self.burst_at(180, 30.0, 0.6)
+        self.assertAlmostEqual(snap["rate"], 0.6)
+        self.assertAlmostEqual(snap["forecast_at_reset"], 30 + 27 + 12.5)
+        self.assertEqual(snap["state"], "ok")
+
+    def test_close_to_the_reset_it_is_the_burst_alone(self):
+        snap = self.burst_at(280, 80.0, 1.0)            # 20 minutes left
+        self.assertAlmostEqual(snap["forecast_at_reset"], 100.0)
+        self.assertEqual(snap["state"], "slow")
+
+    def test_early_in_the_window_the_average_is_over_the_burst_at_least(self):
+        # Twenty minutes in at 5%: that is one burst, not an average of 0.25 a
+        # minute for the rest of the window.
+        snap = self.burst_at(20, 5.0, 0.3)
+        average = 5.0 / 45
+        self.assertAlmostEqual(snap["forecast_at_reset"], 5 + 0.3 * 45 + average * 235)
+        self.assertEqual(snap["state"], "ok")
+
+    def test_the_agents_scale_the_burst_only(self):
+        # 120 min in at 40%, 1% a minute, six agents: the 135 minutes after the
+        # burst add 40/120 a minute = 45 points, so 14 are left for the burst's 45
+        # minutes: 14/45 of the pace, 0.31 of it, is one agent of the six.
+        b = tracker(target=99.0, burst=45.0)
+        b.on_sample(120 * 60 - 900, 25.0, 5 * 3600.0)
+        b.on_sample(120 * 60, 40.0, 5 * 3600.0)
+        b.active_agents = 6
+        snap = b.snapshot(120 * 60)
+        self.assertEqual(snap["state"], "slow")
+        self.assertEqual(snap["max_agents"], 1)
+
+    def test_minutes_to_the_target_follow_the_same_line(self):
+        # 200 min in at 90%, 0.1 a minute: 45 minutes bring 4.5 points, the last
+        # 4.5 come at the average, 0.45 a minute, in 10 more.
+        snap = self.burst_at(200, 90.0, 0.1)
+        self.assertAlmostEqual(snap["minutes_to_target"], 45 + 4.5 / 0.45)
+
+
 class TestMaxAgents(unittest.TestCase):
     def test_the_agents_the_pace_allows(self):
         # 5.58 points are left to 97% over 30.5 minutes: 0.183 a minute. Seven
@@ -561,6 +619,41 @@ class TestTheSlowMessage(BudgetCase):
         self.step(ctl, 11)
         self.step(ctl, 12)
         self.assertEqual(len(self.injected()), 1)
+
+    def test_a_state_says_nothing_until_it_has_held(self):
+        # T39: one whole-number step moves the forecast by several points; a
+        # forecast at the target typed slow and clear six times in twelve minutes.
+        ctl = paced(budget_hold_sec=180.0)
+        sample(ctl, 0, 50.0)
+        sample(ctl, 10, 80.0)
+        self.step(ctl, 10)                               # slow from now on
+        self.step(ctl, 100)
+        self.assertEqual(self.injected(), [])
+        self.step(ctl, 190)
+        self.assertEqual(len(self.injected()), 1)
+
+    def test_a_state_that_flips_back_starts_its_hold_again(self):
+        ctl = paced(budget_hold_sec=180.0)
+        self.to_slow(ctl)                                # slow at t=10
+        ctl.budget_poll = lambda now: None               # the forecast is set by hand below
+        ctl._budget_state, ctl._budget_state_since = "ok", 100.0
+        ctl.budget_forecast = dict(ctl.budget_forecast, state="ok")
+        self.tick_only(ctl, 150)
+        ctl._budget_state, ctl._budget_state_since = "slow", 160.0
+        ctl.budget_forecast = dict(ctl.budget_forecast, state="slow")
+        self.tick_only(ctl, 300)
+        self.assertEqual(self.injected(), [])
+        self.tick_only(ctl, 340)
+        self.assertEqual(len(self.injected()), 1)
+
+    def test_the_target_reached_freezes_without_waiting(self):
+        ctl = paced(budget_hold_sec=180.0)
+        sample(ctl, 0, 96.0)
+        self.step(ctl, 0)
+        sample(ctl, 10, 97.5)
+        self.step(ctl, 10)
+        self.assertTrue(any(t.startswith("Session budget: the 97% target")
+                            for t in self.injected()), self.injected())
 
     def test_the_transition_is_logged(self):
         ctl = paced()
@@ -781,6 +874,7 @@ class TestTheOverridesReplaceTheDefaults(BudgetCase):
         saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
         mod = helper.load(CR_SESSION_BUDGET="97", CR_BUDGET_FREEZE_MIN="0",
+                          CR_BUDGET_HOLD_SEC="0", CR_BUDGET_BURST_MIN="1e9",
                           CR_BUDGET_SLOW_MSG="SLOW {percent}% with {agents} at most",
                           CR_BUDGET_FREEZE_MSG="FREEZE at {target}%.")
         ctl = mod.Controller(dict(mod.CFG, agent="claude", context_tokens=0,
@@ -933,7 +1027,7 @@ class TestTheBudgetInAFakeSession(unittest.TestCase):
         # pace, as fifteen minutes of it would be in a real session.
         e = helper.restart_timers(CR_SESSION_BUDGET="97", CR_BUDGET_FREEZE_MIN="0",
                                   CR_MARGIN_SEC="0", FAKE_STATUS_RESETS_IN="12",
-                                  CR_BUDGET_WINDOW_SEC="1")
+                                  CR_BUDGET_WINDOW_SEC="1", CR_BUDGET_HOLD_SEC="0")
         e.update(env)
         s = helper.one_wrapper(self.work, e)
         self.addCleanup(s.close)
