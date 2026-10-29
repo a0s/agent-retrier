@@ -7,6 +7,19 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [3.1.4] - 2026-10-29
+
+### Changed
+- The session budget's forecast no longer carries the pace of a burst all the
+  way to the reset. The pace of the moment holds for `CR_BUDGET_BURST_MIN` (45
+  minutes), then the window goes on at its own average. Carried to the reset,
+  a burst forecast 102-109% on windows that ended at 57-60%, and the session
+  was held back for nothing.
+- A budget state holds for `CR_BUDGET_HOLD_SEC` (3 minutes) before a message
+  says so; reaching the target itself still freezes at once. One whole-number
+  step of the percent moves the forecast by several points, and a forecast at
+  the target typed slow and clear six times in twelve minutes.
+
 ## [3.1.3] - 2026-10-28
 
 ### Fixed
